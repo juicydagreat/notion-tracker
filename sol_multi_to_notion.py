@@ -12,26 +12,23 @@
 #   TITLE_PROP_PERWALLET   (default "Wallet")  # Title column name in Per-Wallet DB
 #   TOTAL_TITLE_PROP       (default "Name")    # Title column name in Daily Total DB
 #
-# Expected Notion schema:
+# Expected Notion schema
 # Per-Wallet DB:
 #   - Title column: "Wallet" (or set TITLE_PROP_PERWALLET)
-#   - Date (Date)          <-- used for AEST day tagging
+#   - Date (Date)
 #   - End Balance (Number)
-#   - Delta (Number)       <-- script writes it
+#   - Delta (Number)
 #
 # Daily-Total DB:
 #   - Title column: "Name" (or "Date"; set TOTAL_TITLE_PROP if different)
 #   - Date (Date)
 #   - End Balance (Number)
 #   - Delta (Number)
-#
-# NOTE: We compute "today" using Australia/Brisbane (no DST).
-#       Delta is current - previous recorded End Balance.
 
 import os, sys, json, urllib.request, urllib.error
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
@@ -95,23 +92,10 @@ def per_wallet_latest_end(db_id: str, wallet: str) -> Optional[float]:
     if not results:
         return None
     props = results[0]["properties"]
-    end_prop = props.get("End Balance", {}).get("number")
-    return end_prop  # may be None
-
-def create_per_wallet_row(db_id: str, date_iso: str, wallet: str, end_balance: float, delta: Optional[float]):
-    props = {
-        "Date": {"date": {"start": date_iso}},
-        TITLE_PROP_PERWALLET: {"title": [{"text": {"content": wallet}}]},
-        "End Balance": {"number": float(end_balance)},
-    }
-    if delta is not None:
-        props["Delta"] = {"number": float(delta)}
-
-    body = {"parent": {"database_id": db_id}, "properties": props}
-    notion_req("https://api.notion.com/v1/pages", body)
+    return props.get("End Balance", {}).get("number")
 
 def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str]]:
-    """Return (latest End Balance, latest Date string) from Daily Total DB, or (None,None)."""
+    """Return (latest total End Balance, latest Date string) from Daily Total DB, or (None,None)."""
     body = {
         "sorts": [{"property": "Date", "direction": "descending"}],
         "page_size": 1
@@ -125,14 +109,28 @@ def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str
     date_prop = props.get("Date", {}).get("date", {}).get("start")
     return end_prop, date_prop
 
+# ---------- Notion writes (with rounding to 2 decimal places) ----------
+def create_per_wallet_row(db_id: str, date_iso: str, wallet: str, end_balance: float, delta: Optional[float]):
+    props = {
+        "Date": {"date": {"start": date_iso}},
+        TITLE_PROP_PERWALLET: {"title": [{"text": {"content": wallet}}]},
+        "End Balance": {"number": round(end_balance, 2)},  # ROUND HERE
+    }
+    if delta is not None:
+        props["Delta"] = {"number": round(delta, 2)}       # ROUND HERE
+
+    body = {"parent": {"database_id": db_id}, "properties": props}
+    notion_req("https://api.notion.com/v1/pages", body)
+
 def create_daily_total_row(db_id: str, date_iso: str, end_total: float, delta_total: Optional[float]):
     props = {
-        TOTAL_TITLE_PROP: {"title": [{"text": {"content": date_iso}}]},  # fill Title
+        TOTAL_TITLE_PROP: {"title": [{"text": {"content": date_iso}}]},  # fill Title with date string
         "Date": {"date": {"start": date_iso}},
-        "End Balance": {"number": float(end_total)},
+        "End Balance": {"number": round(end_total, 2)},                  # ROUND HERE
     }
     if delta_total is not None:
-        props["Delta"] = {"number": float(delta_total)}
+        props["Delta"] = {"number": round(delta_total, 2)}               # ROUND HERE
+
     body = {"parent": {"database_id": db_id}, "properties": props}
     notion_req("https://api.notion.com/v1/pages", body)
 
@@ -145,7 +143,7 @@ def main():
     if not RPC_URL.startswith("https://"):
         fail(f"SOLANA_RPC_URL must be HTTPS; got '{RPC_URL}'")
 
-    # AEST day label (the row's Date)
+    # AEST date label for the row
     now_utc = datetime.now(timezone.utc)
     today_aest = now_utc.astimezone(AEST).date().isoformat()  # 'YYYY-MM-DD'
 
@@ -172,13 +170,13 @@ def main():
     delta_total = None if prev_total_end is None else (end_total - prev_total_end)
     create_daily_total_row(DB_TOTAL, today_aest, end_total, delta_total)
 
-    # 5) Console log
+    # 5) Console log (full precision here is fine or you can show rounded)
     print(f"{today_aest} @ 03:00 AEST | {len(per_rows)} wallets")
     for w, end_bal, delta in per_rows:
-        d = "None" if delta is None else f"{delta:+.9f}"
-        print(f"  {w[:8]}…  End={end_bal:.9f}  Δ={d}")
-    dt = "None" if delta_total is None else f"{delta_total:+.9f}"
-    print(f"TOTAL End={end_total:.9f}  Δ={dt}")
+        d = "None" if delta is None else f"{round(delta, 2):+.2f}"
+        print(f"  {w[:8]}…  End={round(end_bal, 2):.2f}  Δ={d}")
+    dt = "None" if delta_total is None else f"{round(delta_total, 2):+.2f}"
+    print(f"TOTAL End={round(end_total, 2):.2f}  Δ={dt}")
 
 if __name__ == "__main__":
     main()
