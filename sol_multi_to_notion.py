@@ -1,5 +1,5 @@
 # sol_multi_to_notion.py
-# Daily run at 03:00 AEST. Computes delta vs the previous recorded entry in Notion.
+# Daily run (schedule via GitHub Actions). Computes delta vs the previous recorded entry in Notion.
 #
 # Required GitHub Secrets (Actions -> Secrets and variables):
 #   NOTION_TOKEN            (Internal Integration token, starts with secret_)
@@ -39,6 +39,7 @@ WALLETS = [w.strip() for w in (os.getenv("WALLETS_CSV") or "").split(",") if w.s
 TITLE_PROP_PERWALLET = os.getenv("TITLE_PROP_PERWALLET", "Wallet").strip()
 TOTAL_TITLE_PROP = os.getenv("TOTAL_TITLE_PROP", "Name").strip()
 
+# We label rows with the Australia/Brisbane date
 AEST = ZoneInfo("Australia/Brisbane")
 
 # ---------- helpers ----------
@@ -80,10 +81,7 @@ def rpc_get_balance(wallet: str) -> float:
 def per_wallet_latest_end(db_id: str, wallet: str) -> Optional[float]:
     """Return the most recent End Balance for this wallet (any date), or None."""
     body = {
-        "filter": {
-            "property": TITLE_PROP_PERWALLET,
-            "title": {"equals": wallet}
-        },
+        "filter": {"property": TITLE_PROP_PERWALLET, "title": {"equals": wallet}},
         "sorts": [{"property": "Date", "direction": "descending"}],
         "page_size": 1
     }
@@ -96,10 +94,7 @@ def per_wallet_latest_end(db_id: str, wallet: str) -> Optional[float]:
 
 def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str]]:
     """Return (latest total End Balance, latest Date string) from Daily Total DB, or (None,None)."""
-    body = {
-        "sorts": [{"property": "Date", "direction": "descending"}],
-        "page_size": 1
-    }
+    body = {"sorts": [{"property": "Date", "direction": "descending"}], "page_size": 1}
     res = notion_req(f"https://api.notion.com/v1/databases/{db_id}/query", body)
     results = res.get("results", [])
     if not results:
@@ -109,27 +104,29 @@ def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str
     date_prop = props.get("Date", {}).get("date", {}).get("start")
     return end_prop, date_prop
 
-# ---------- Notion writes (with rounding to 2 decimal places) ----------
+# ---------- Notion writes (rounded to 2 decimals) ----------
 def create_per_wallet_row(db_id: str, date_iso: str, wallet: str, end_balance: float, delta: Optional[float]):
     props = {
         "Date": {"date": {"start": date_iso}},
         TITLE_PROP_PERWALLET: {"title": [{"text": {"content": wallet}}]},
-        "End Balance": {"number": round(end_balance, 2)},  # ROUND HERE
+        "End Balance": {"number": round(end_balance, 2)},
     }
     if delta is not None:
-        props["Delta"] = {"number": round(delta, 2)}       # ROUND HERE
+        props["Delta"] = {"number": round(delta, 2)}
 
     body = {"parent": {"database_id": db_id}, "properties": props}
     notion_req("https://api.notion.com/v1/pages", body)
 
 def create_daily_total_row(db_id: str, date_iso: str, end_total: float, delta_total: Optional[float]):
+    # Show total SOL in the Title so Calendar cards display the number
+    title_text = f"{round(end_total, 2):.2f} SOL"
     props = {
-        TOTAL_TITLE_PROP: {"title": [{"text": {"content": date_iso}}]},  # fill Title with date string
-        "Date": {"date": {"start": date_iso}},
-        "End Balance": {"number": round(end_total, 2)},                  # ROUND HERE
+        TOTAL_TITLE_PROP: {"title": [{"text": {"content": title_text}}]},  # calendar card text
+        "Date": {"date": {"start": date_iso}},                              # calendar placement
+        "End Balance": {"number": round(end_total, 2)},
     }
     if delta_total is not None:
-        props["Delta"] = {"number": round(delta_total, 2)}               # ROUND HERE
+        props["Delta"] = {"number": round(delta_total, 2)}
 
     body = {"parent": {"database_id": db_id}, "properties": props}
     notion_req("https://api.notion.com/v1/pages", body)
@@ -145,7 +142,7 @@ def main():
 
     # AEST date label for the row
     now_utc = datetime.now(timezone.utc)
-    today_aest = now_utc.astimezone(AEST).date().isoformat()  # 'YYYY-MM-DD'
+    today_aest = now_utc.astimezone(ZoneInfo("Australia/Brisbane")).date().isoformat()  # 'YYYY-MM-DD'
 
     # 1) Sample all wallets
     per = []
@@ -170,8 +167,8 @@ def main():
     delta_total = None if prev_total_end is None else (end_total - prev_total_end)
     create_daily_total_row(DB_TOTAL, today_aest, end_total, delta_total)
 
-    # 5) Console log (full precision here is fine or you can show rounded)
-    print(f"{today_aest} @ 03:00 AEST | {len(per_rows)} wallets")
+    # 5) Console log
+    print(f"{today_aest} | {len(per_rows)} wallets")
     for w, end_bal, delta in per_rows:
         d = "None" if delta is None else f"{round(delta, 2):+.2f}"
         print(f"  {w[:8]}…  End={round(end_bal, 2):.2f}  Δ={d}")
