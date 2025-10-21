@@ -3,7 +3,7 @@ name: Solana Tracker (Daily 3am AEST)
 on:
   schedule:
     - cron: "0 17 * * *"   # 03:00 AEST daily (AEST = UTC+10 → 17:00 UTC previous day)
-  workflow_dispatch: {}     # keep manual run
+  workflow_dispatch: {}     # keep manual run available
 
 jobs:
   run:
@@ -19,7 +19,7 @@ jobs:
           NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
           NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
           WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
-          # Optional:
+          # Optional overrides if your title column names differ:
           # TITLE_PROP_PERWALLET: Wallet
           # TOTAL_TITLE_PROP: Name
           # SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
