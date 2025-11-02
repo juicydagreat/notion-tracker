@@ -42,7 +42,6 @@ TOTAL_TITLE_PROP = os.getenv("TOTAL_TITLE_PROP", "Name").strip()
 # We label rows with the Australia/Brisbane date
 AEST = ZoneInfo("Australia/Brisbane")
 
-# ---------- helpers ----------
 def fail(msg: str):
     print(f"ERROR: {msg}")
     sys.exit(1)
@@ -77,9 +76,7 @@ def rpc_get_balance(wallet: str) -> float:
         fail(f"Unexpected RPC response for {wallet}: {out}")
     return lamports / 1_000_000_000
 
-# ---------- Notion queries ----------
 def per_wallet_latest_end(db_id: str, wallet: str) -> Optional[float]:
-    """Return the most recent End Balance for this wallet (any date), or None."""
     body = {
         "filter": {"property": TITLE_PROP_PERWALLET, "title": {"equals": wallet}},
         "sorts": [{"property": "Date", "direction": "descending"}],
@@ -93,7 +90,6 @@ def per_wallet_latest_end(db_id: str, wallet: str) -> Optional[float]:
     return props.get("End Balance", {}).get("number")
 
 def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str]]:
-    """Return (latest total End Balance, latest Date string) from Daily Total DB, or (None,None)."""
     body = {"sorts": [{"property": "Date", "direction": "descending"}], "page_size": 1}
     res = notion_req(f"https://api.notion.com/v1/databases/{db_id}/query", body)
     results = res.get("results", [])
@@ -104,34 +100,30 @@ def latest_total_end_and_date(db_id: str) -> Tuple[Optional[float], Optional[str
     date_prop = props.get("Date", {}).get("date", {}).get("start")
     return end_prop, date_prop
 
-# ---------- Notion writes (rounded to 2 decimals) ----------
 def create_per_wallet_row(db_id: str, date_iso: str, wallet: str, end_balance: float, delta: Optional[float]):
+    # Changed line: Title now shows balance (e.g. "138.46 SOL") instead of wallet address
     props = {
         "Date": {"date": {"start": date_iso}},
-        TITLE_PROP_PERWALLET: {"title": [{"text": {"content": wallet}}]},
+        TITLE_PROP_PERWALLET: {"title": [{"text": {"content": f"{round(end_balance, 2):.2f} SOL"}}]},
         "End Balance": {"number": round(end_balance, 2)},
     }
     if delta is not None:
         props["Delta"] = {"number": round(delta, 2)}
-
     body = {"parent": {"database_id": db_id}, "properties": props}
     notion_req("https://api.notion.com/v1/pages", body)
 
 def create_daily_total_row(db_id: str, date_iso: str, end_total: float, delta_total: Optional[float]):
-    # Show total SOL in the Title so Calendar cards display the number
     title_text = f"{round(end_total, 2):.2f} SOL"
     props = {
-        TOTAL_TITLE_PROP: {"title": [{"text": {"content": title_text}}]},  # calendar card text
-        "Date": {"date": {"start": date_iso}},                              # calendar placement
+        TOTAL_TITLE_PROP: {"title": [{"text": {"content": title_text}}]},
+        "Date": {"date": {"start": date_iso}},
         "End Balance": {"number": round(end_total, 2)},
     }
     if delta_total is not None:
         props["Delta"] = {"number": round(delta_total, 2)}
-
     body = {"parent": {"database_id": db_id}, "properties": props}
     notion_req("https://api.notion.com/v1/pages", body)
 
-# ---------- main ----------
 def main():
     if not NOTION_TOKEN: fail("NOTION_TOKEN missing")
     if not DB_PER: fail("NOTION_DB_PERWALLET missing")
@@ -140,34 +132,28 @@ def main():
     if not RPC_URL.startswith("https://"):
         fail(f"SOLANA_RPC_URL must be HTTPS; got '{RPC_URL}'")
 
-    # AEST date label for the row
     now_utc = datetime.now(timezone.utc)
-    today_aest = now_utc.astimezone(ZoneInfo("Australia/Brisbane")).date().isoformat()  # 'YYYY-MM-DD'
+    today_aest = now_utc.astimezone(ZoneInfo("Australia/Brisbane")).date().isoformat()
 
-    # 1) Sample all wallets
     per = []
     for w in WALLETS:
         bal = rpc_get_balance(w)
         per.append((w, bal))
 
-    # 2) Compute per-wallet deltas (vs latest previous Notion entry for same wallet)
     per_rows = []
     for w, current in per:
         prev = per_wallet_latest_end(DB_PER, w)
         delta = None if prev is None else (current - prev)
         per_rows.append((w, current, delta))
 
-    # 3) Write per-wallet rows for today
     for w, end_bal, delta in per_rows:
         create_per_wallet_row(DB_PER, today_aest, w, end_bal, delta)
 
-    # 4) Compute & write the daily total (sum + delta vs latest total)
     end_total = sum(end for _, end, _ in per_rows)
     prev_total_end, _ = latest_total_end_and_date(DB_TOTAL)
     delta_total = None if prev_total_end is None else (end_total - prev_total_end)
     create_daily_total_row(DB_TOTAL, today_aest, end_total, delta_total)
 
-    # 5) Console log
     print(f"{today_aest} | {len(per_rows)} wallets")
     for w, end_bal, delta in per_rows:
         d = "None" if delta is None else f"{round(delta, 2):+.2f}"
