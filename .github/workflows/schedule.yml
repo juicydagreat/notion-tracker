@@ -2,13 +2,13 @@ name: Solana Tracker (Daily 3am AEST)
 
 on:
   schedule:
-    - cron: "0 17 * * *" # 03:00 AEST daily (UTC+10)
-  workflow_dispatch:
+    # 03:00 AEST daily (UTC+10) => 17:00 UTC previous day
+    - cron: "0 17 * * *"
+  workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -25,12 +25,11 @@ jobs:
           NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
           WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
 
-          # 🔑 TITLE COLUMN OVERRIDES (CRITICAL)
-          TITLE_PROP_PERWALLET: Wallet
-          TOTAL_TITLE_PROP: Name
+          # Title column name in your Per-Wallet Notion DB (your screenshot shows it's "Wallet")
+          TITLE_PROP_PERWALLET: ${{ secrets.TITLE_PROP_PERWALLET }}
 
-          # Optional (recommended to avoid rate limits)
-          SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
+          # Optional: use your private RPC (recommended to avoid 429s)
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
 
         run: |
           python sol_multi_to_notion.py
