@@ -24,4 +24,4 @@ jobs:
           # TOTAL_TITLE_PROP: Name
           # SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
         run: |
-          python sol_multi_to_notion.py
+          python usdc_sol_multi_to_notion.py
