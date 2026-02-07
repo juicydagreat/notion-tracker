@@ -1,8 +1,9 @@
 import os
-import csv
 import json
 import time
+import random
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 # =========================
@@ -16,22 +17,104 @@ SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.sola
 
 USDC_MINT = "EPjFWdd5AufqSSqeM2q4Y9Jv6R3hHc3zZkZz8pJ9oG"
 
+
 # =========================
 # HELPERS
 # =========================
 def r2(x):
     return None if x is None else round(float(x), 2)
 
-def rpc_post(payload):
-    req = urllib.request.Request(
-        SOLANA_RPC_URL,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read())
 
-def rpc_get_sol_balance(wallet):
+def parse_wallets(raw: str) -> list[str]:
+    """
+    Accepts:
+      - comma-separated
+      - newline-separated
+      - mixed (your current secret format)
+    Returns unique wallets in original order.
+    """
+    if raw is None:
+        return []
+
+    # Replace newlines with commas, then split
+    parts = raw.replace("\n", ",").split(",")
+    out = []
+    seen = set()
+
+    for p in parts:
+        w = p.strip()
+        if not w:
+            continue
+        # Basic sanity: Solana pubkeys are typically 32-44 chars base58
+        if len(w) < 32 or len(w) > 60:
+            # keep it out to avoid WrongSize / invalid param
+            continue
+        if w not in seen:
+            out.append(w)
+            seen.add(w)
+    return out
+
+
+def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
+    """
+    Robust JSON-RPC POST with retry/backoff and clear error messages.
+    Handles:
+      - HTTP 429
+      - transient 5xx
+      - RPC {"error": ...}
+    """
+    last_err = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(
+                SOLANA_RPC_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                raise Exception(f"RPC returned non-JSON response: {raw[:400]}")
+
+            # RPC-level error (even if HTTP 200)
+            if isinstance(data, dict) and "error" in data and data["error"] is not None:
+                raise Exception(f"Solana RPC error: {data['error']}")
+
+            if not isinstance(data, dict):
+                raise Exception(f"RPC returned unexpected payload type: {type(data)}")
+
+            return data
+
+        except urllib.error.HTTPError as e:
+            # Read body for better diagnostics
+            body = ""
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            last_err = f"HTTPError {e.code}: {e.reason}. Body: {body[:400]}"
+
+            # Retry only for rate limit / transient
+            if e.code not in (429, 500, 502, 503, 504):
+                raise Exception(f"RPC hard failure: {last_err}")
+
+        except Exception as e:
+            last_err = str(e)
+
+        # Backoff with jitter
+        sleep_s = min(2 ** attempt, 30) + random.uniform(0.0, 0.8)
+        time.sleep(sleep_s)
+
+    raise Exception(f"RPC failed after retries. Last error: {last_err}")
+
+
+def rpc_get_sol_balance(wallet: str) -> float:
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -39,9 +122,12 @@ def rpc_get_sol_balance(wallet):
         "params": [wallet],
     }
     res = rpc_post(payload)
+    if "result" not in res or res["result"] is None or "value" not in res["result"]:
+        raise Exception(f"RPC missing result for getBalance({wallet}). Response: {res}")
     return res["result"]["value"] / 1e9
 
-def rpc_get_usdc_balance(wallet):
+
+def rpc_get_usdc_balance(wallet: str) -> float:
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -53,12 +139,21 @@ def rpc_get_usdc_balance(wallet):
         ],
     }
     res = rpc_post(payload)
+    if "result" not in res or res["result"] is None or "value" not in res["result"]:
+        raise Exception(f"RPC missing result for getTokenAccountsByOwner({wallet}). Response: {res}")
+
     total = 0.0
     for acc in res["result"]["value"]:
-        total += float(
-            acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"]
-        )
+        try:
+            amt = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["uiAmount"]
+            if amt is not None:
+                total += float(amt)
+        except Exception:
+            # ignore malformed token accounts rather than killing the run
+            continue
+
     return total
+
 
 def notion_headers():
     return {
@@ -67,51 +162,62 @@ def notion_headers():
         "Notion-Version": "2022-06-28",
     }
 
+
 def notion_number(v):
     return None if v is None else {"number": v}
+
 
 def notion_date(d):
     return {"date": {"start": d}}
 
+
 def notion_create_page(db, props):
-    body = {
-        "parent": {"database_id": db},
-        "properties": props,
-    }
+    body = {"parent": {"database_id": db}, "properties": props}
+
     req = urllib.request.Request(
         "https://api.notion.com/v1/pages",
-        data=json.dumps(body).encode(),
+        data=json.dumps(body).encode("utf-8"),
         headers=notion_headers(),
+        method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise Exception(f"Notion returned non-JSON: {raw[:400]}")
+
+    if isinstance(data, dict) and data.get("object") == "error":
+        raise Exception(f"Notion error: {data}")
+
+    return data
+
 
 # =========================
 # MAIN
 # =========================
 def main():
-    wallets = []
-    for w in WALLETS_CSV.split(","):
-        w = w.strip()
-        if w:
-            wallets.append(w)
-
+    wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
-        raise Exception("No wallets provided")
+        raise Exception(
+            "No wallets found in WALLETS_CSV. "
+            "Your secret must be comma/newline separated Solana addresses."
+        )
 
     per_wallet = []
     total_sol = 0.0
     total_usdc = 0.0
 
     for w in wallets:
-        sol = rpc_get_sol_balance(w)
-        usdc = rpc_get_usdc_balance(w)
+        sol_raw = rpc_get_sol_balance(w)
+        usdc_raw = rpc_get_usdc_balance(w)
 
-        sol = r2(sol)
-        usdc = r2(usdc)
+        sol = r2(sol_raw)
+        usdc = r2(usdc_raw)
 
         per_wallet.append((w, sol, usdc))
-
         total_sol += sol
         total_usdc += usdc
 
@@ -120,9 +226,7 @@ def main():
 
     today = datetime.now(timezone.utc).date().isoformat()
 
-    # =========================
-    # PER WALLET PAGES
-    # =========================
+    # PER WALLET
     for w, sol, usdc in per_wallet:
         props = {
             "Wallet": {"title": [{"text": {"content": w}}]},
@@ -132,17 +236,15 @@ def main():
         }
         notion_create_page(NOTION_DB_PERWALLET, props)
 
-    # =========================
-    # DAILY TOTAL PAGE
-    # =========================
+    # DAILY TOTAL
     total_props = {
-        "Name": {"title": [{"text": {"content": f"{total_sol} SOL"}}]},
+        "Name": {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},
         "Date": notion_date(today),
         "End Balance": notion_number(total_sol),
         "USDC End Balance": notion_number(total_usdc),
     }
-
     notion_create_page(NOTION_DB_DAILYTOTAL, total_props)
+
 
 if __name__ == "__main__":
     main()
