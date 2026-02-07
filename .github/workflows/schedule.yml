@@ -16,10 +16,12 @@ jobs:
           python-version: "3.11"
 
       - name: Run tracker
-        env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
-          NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
+      NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
+      WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
+      SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+
         run: |
           python sol_multi_to_notion.py
