@@ -1,232 +1,98 @@
-import os, sys, json, time, urllib.request, urllib.error
+import os
+import csv
+import requests
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from typing import Optional, Tuple, Dict, Any, List
 
-# ---------- ENV ----------
-RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
-DB_PER = os.getenv("NOTION_DB_PERWALLET", "").strip()
-DB_TOTAL = os.getenv("NOTION_DB_DAILYTOTAL", "").strip()
-WALLETS = [w.strip() for w in (os.getenv("WALLETS_CSV") or "").split(",") if w.strip()]
+# -----------------------------
+# ENV
+# -----------------------------
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+DB_DAILY = os.environ["NOTION_DB_DAILYTOTAL"]
+WALLETS_CSV = os.environ["WALLETS_CSV"]
+RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-# Notion property names (override via GitHub Secrets if needed)
-TITLE_PROP_PERWALLET = os.getenv("TITLE_PROP_PERWALLET", "Wallet").strip()     # your Per-Wallet title column name
-TOTAL_TITLE_PROP = os.getenv("TOTAL_TITLE_PROP", "Name").strip()              # Daily Total title column name
-WALLET_ADDR_PROP = os.getenv("WALLET_ADDR_PROP", "Wallet Address").strip()    # rich_text column holding the real wallet address
+HEADERS = {
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Content-Type": "application/json",
+    "Notion-Version": "2022-06-28"
+}
 
-# Canonical Solana USDC mint (Circle)
-USDC_MINT = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDC_DECIMALS = 6
 
-# Token programs
-TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-
-AEST = ZoneInfo("Australia/Brisbane")
-
-def fail(msg: str):
-    print(f"ERROR: {msg}")
-    sys.exit(1)
-
-# ---------- NOTION ----------
-def notion_req(url: str, body: dict | None = None, method: str = "POST") -> dict:
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28",
-        }
+# -----------------------------
+# SOL RPC HELPERS
+# -----------------------------
+def rpc(method, params):
+    res = requests.post(
+        RPC_URL,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=20
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode() or "{}"
-            return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode()
-        fail(f"Notion {e.code} {e.reason}: {detail}")
+    res.raise_for_status()
+    return res.json()["result"]
 
-def _num(props: dict, name: str) -> Optional[float]:
-    v = props.get(name, {}).get("number")
-    return None if v is None else float(v)
-
-def per_wallet_latest_row(db_id: str, wallet_addr: str) -> Optional[dict]:
-    body = {
-        "filter": {"property": WALLET_ADDR_PROP, "rich_text": {"equals": wallet_addr}},
-        "sorts": [{"property": "Date", "direction": "descending"}],
-        "page_size": 1
-    }
-    res = notion_req(f"https://api.notion.com/v1/databases/{db_id}/query", body)
-    results = res.get("results", [])
-    return results[0] if results else None
-
-def latest_total_row(db_id: str) -> Optional[dict]:
-    body = {"sorts": [{"property": "Date", "direction": "descending"}], "page_size": 1}
-    res = notion_req(f"https://api.notion.com/v1/databases/{db_id}/query", body)
-    results = res.get("results", [])
-    return results[0] if results else None
-
-def create_per_wallet_row(
-    db_id: str, date_iso: str, wallet_addr: str,
-    sol_end: float, sol_delta: Optional[float],
-    usdc_end: float, usdc_delta: Optional[float],
-):
-    props: Dict[str, Any] = {
-        "Date": {"date": {"start": date_iso}},
-        TITLE_PROP_PERWALLET: {"title": [{"text": {"content": f"{sol_end:.2f} SOL"}}]},
-        WALLET_ADDR_PROP: {"rich_text": [{"text": {"content": wallet_addr}}]},
-        "End Balance": {"number": round(sol_end, 2)},
-        "USDC End Balance": {"number": round(usdc_end, 2)},
-    }
-    if sol_delta is not None:
-        props["Delta"] = {"number": round(sol_delta, 2)}
-    if usdc_delta is not None:
-        props["USDC Delta"] = {"number": round(usdc_delta, 2)}
-
-    body = {"parent": {"database_id": db_id}, "properties": props}
-    notion_req("https://api.notion.com/v1/pages", body)
-
-def create_daily_total_row(db_id: str, date_iso: str, sol_total_end: float, sol_total_delta: Optional[float]):
-    props: Dict[str, Any] = {
-        TOTAL_TITLE_PROP: {"title": [{"text": {"content": f"{sol_total_end:.2f} SOL"}}]},
-        "Date": {"date": {"start": date_iso}},
-        "End Balance": {"number": round(sol_total_end, 2)},
-    }
-    if sol_total_delta is not None:
-        props["Delta"] = {"number": round(sol_total_delta, 2)}
-
-    body = {"parent": {"database_id": db_id}, "properties": props}
-    notion_req("https://api.notion.com/v1/pages", body)
-
-# ---------- RPC ----------
-def rpc_post(payload: dict, max_retries: int = 6) -> dict:
-    if not RPC_URL.startswith("https://"):
-        fail(f"SOLANA_RPC_URL must be HTTPS; got '{RPC_URL}'")
-
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(RPC_URL, data=data, headers={"Content-Type": "application/json"})
-
-    backoff = 1.0
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code} {e.reason}: {e.read().decode(errors='replace')}"
-            if e.code == 429:
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 16.0)
-                continue
-            fail(f"RPC error: {last_err}")
-        except Exception as e:
-            last_err = str(e)
-            time.sleep(backoff)
-            backoff = min(backoff * 2.0, 16.0)
-
-    fail(f"RPC failed after retries: {last_err}")
-
-def rpc_get_sol_balance(wallet: str) -> float:
-    payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[wallet, {"commitment":"finalized"}]}
-    out = rpc_post(payload)
-    lamports = out["result"]["value"]
+def get_sol_balance(wallet):
+    lamports = rpc("getBalance", [wallet])["value"]
     return lamports / 1_000_000_000
 
-def _sum_mint_from_token_accounts(value: list, mint: str) -> Tuple[float, int]:
-    total = 0.0
-    hits = 0
-    for item in value:
-        try:
-            info = item["account"]["data"]["parsed"]["info"]
-            if info.get("mint") != mint:
-                continue
-            amt = info["tokenAmount"]
-            s = amt.get("uiAmountString")
-            if s is not None:
-                total += float(s)
-            else:
-                ui = amt.get("uiAmount")
-                total += float(ui or 0.0)
-            hits += 1
-        except Exception:
-            continue
-    return float(total), hits
-
-def _get_all_token_accounts_by_program(owner: str, program_id: str) -> list:
-    # IMPORTANT: correct RPC shape = use programId filter, then filter mint client-side.
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenAccountsByOwner",
-        "params": [
-            owner,
-            {"programId": program_id},
-            {"encoding": "jsonParsed", "commitment": "finalized"}
+def get_usdc_balance(wallet):
+    accounts = rpc(
+        "getTokenAccountsByOwner",
+        [
+            wallet,
+            {"mint": USDC_MINT},
+            {"encoding": "jsonParsed"}
         ]
+    )["value"]
+
+    total = 0.0
+    for acc in accounts:
+        amount = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]
+        total += int(amount) / (10 ** USDC_DECIMALS)
+
+    return round(total, 6)
+
+# -----------------------------
+# NOTION
+# -----------------------------
+def create_daily_row(sol, usdc):
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    payload = {
+        "parent": {"database_id": DB_DAILY},
+        "properties": {
+            "Name": {
+                "title": [{"text": {"content": f"{sol:.2f} SOL"}}]
+            },
+            "Date": {"date": {"start": today}},
+            "End Balance": {"number": round(sol, 6)},
+            "USDC End Balance": {"number": round(usdc, 6)}
+        }
     }
-    out = rpc_post(payload)
-    return ((out.get("result") or {}).get("value") or [])
 
-def rpc_get_usdc_balance(owner: str) -> Tuple[float, Dict[str, int]]:
-    """
-    Robust: query ALL token accounts (Token + Token-2022) and filter by mint locally.
-    Returns (balance, debug_counts)
-    """
-    v1 = _get_all_token_accounts_by_program(owner, TOKEN_PROGRAM_ID)
-    bal1, hits1 = _sum_mint_from_token_accounts(v1, USDC_MINT)
+    r = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json=payload)
+    if r.status_code != 200:
+        raise Exception(r.text)
 
-    v2 = _get_all_token_accounts_by_program(owner, TOKEN_2022_PROGRAM_ID)
-    bal2, hits2 = _sum_mint_from_token_accounts(v2, USDC_MINT)
-
-    return float(bal1 + bal2), {"token_hits": hits1, "token2022_hits": hits2}
-
-# ---------- MAIN ----------
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
-    if not NOTION_TOKEN: fail("NOTION_TOKEN missing")
-    if not DB_PER: fail("NOTION_DB_PERWALLET missing")
-    if not DB_TOTAL: fail("NOTION_DB_DAILYTOTAL missing")
-    if not WALLETS: fail("WALLETS_CSV missing or empty")
+    wallets = []
+    reader = csv.DictReader(WALLETS_CSV.strip().splitlines())
+    for row in reader:
+        wallets.append(row["wallet"].strip())
 
-    today_aest = datetime.now(timezone.utc).astimezone(AEST).date().isoformat()
+    total_sol = 0.0
+    total_usdc = 0.0
 
-    per_rows = []
-    for w in WALLETS:
-        sol_end = rpc_get_sol_balance(w)
-        usdc_end, dbg = rpc_get_usdc_balance(w)
+    for w in wallets:
+        total_sol += get_sol_balance(w)
+        total_usdc += get_usdc_balance(w)
 
-        prev = per_wallet_latest_row(DB_PER, w)
-        if prev is None:
-            sol_delta = None
-            usdc_delta = None
-        else:
-            props = prev.get("properties", {})
-            prev_sol = _num(props, "End Balance")
-            prev_usdc = _num(props, "USDC End Balance")
-            sol_delta = None if prev_sol is None else (sol_end - prev_sol)
-            usdc_delta = None if prev_usdc is None else (usdc_end - prev_usdc)
-
-        per_rows.append((w, sol_end, sol_delta, usdc_end, usdc_delta, dbg))
-
-    for w, sol_end, sol_delta, usdc_end, usdc_delta, _dbg in per_rows:
-        create_per_wallet_row(DB_PER, today_aest, w, sol_end, sol_delta, usdc_end, usdc_delta)
-
-    sol_total_end = sum(x[1] for x in per_rows)
-    prev_total = latest_total_row(DB_TOTAL)
-    if prev_total is None:
-        sol_total_delta = None
-    else:
-        props = prev_total.get("properties", {})
-        prev_sol_total = _num(props, "End Balance")
-        sol_total_delta = None if prev_sol_total is None else (sol_total_end - prev_sol_total)
-
-    create_daily_total_row(DB_TOTAL, today_aest, sol_total_end, sol_total_delta)
-
-    print(f"{today_aest} | wallets={len(per_rows)} | USDC_MINT={USDC_MINT}")
-    for w, sol_end, sol_delta, usdc_end, usdc_delta, dbg in per_rows:
-        sd = "None" if sol_delta is None else f"{sol_delta:+.2f}"
-        ud = "None" if usdc_delta is None else f"{usdc_delta:+.2f}"
-        print(f"  {w[:8]}… SOL={sol_end:.2f} Δ={sd} | USDC={usdc_end:.2f} Δ={ud} | hits={dbg}")
+    create_daily_row(total_sol, total_usdc)
+    print(f"OK → SOL={total_sol:.4f} USDC={total_usdc:.4f}")
 
 if __name__ == "__main__":
     main()
