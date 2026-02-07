@@ -23,5 +23,6 @@ jobs:
           # TITLE_PROP_PERWALLET: Wallet
           # TOTAL_TITLE_PROP: Name
           # SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
-        run: |
-          python usdc_sol_multi_to_notion.py
+          run: |
+            python sol_multi_to_notion.py
+
