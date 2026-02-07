@@ -2,7 +2,7 @@ name: Solana Tracker (Daily 3am AEST)
 
 on:
   schedule:
-    - cron: "0 17 * * *"   # 03:00 AEST (UTC+10)
+    - cron: "0 17 * * *" # 03:00 AEST daily (UTC+10)
   workflow_dispatch:
 
 jobs:
@@ -24,6 +24,13 @@ jobs:
           NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
           NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
           WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
-          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
+
+          # 🔑 TITLE COLUMN OVERRIDES (CRITICAL)
+          TITLE_PROP_PERWALLET: Wallet
+          TOTAL_TITLE_PROP: Name
+
+          # Optional (recommended to avoid rate limits)
+          SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
+
         run: |
           python sol_multi_to_notion.py
