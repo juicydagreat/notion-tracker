@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import re
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"]
 WALLETS_CSV = os.environ["WALLETS_CSV"]
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
+# USDC mint (Solana mainnet)
 USDC_MINT = "EPjFWdd5AufqSSqeM2q4Y9Jv6R3hHc3zZkZz8pJ9oG"
 
 
@@ -27,28 +29,21 @@ def r2(x):
 
 def parse_wallets(raw: str) -> list[str]:
     """
-    Accepts:
-      - comma-separated
-      - newline-separated
-      - mixed (your current secret format)
-    Returns unique wallets in original order.
+    Robust wallet extraction:
+    - Instead of splitting by commas/newlines (prone to hidden chars),
+      we extract valid base58 pubkeys of length 32-44.
+    - Dedupes while preserving order.
     """
-    if raw is None:
+    if not raw:
         return []
 
-    # Replace newlines with commas, then split
-    parts = raw.replace("\n", ",").split(",")
+    # Solana pubkey base58 alphabet excludes 0,O,I,l
+    pattern = r"[1-9A-HJ-NP-Za-km-z]{32,44}"
+    candidates = re.findall(pattern, raw)
+
     out = []
     seen = set()
-
-    for p in parts:
-        w = p.strip()
-        if not w:
-            continue
-        # Basic sanity: Solana pubkeys are typically 32-44 chars base58
-        if len(w) < 32 or len(w) > 60:
-            # keep it out to avoid WrongSize / invalid param
-            continue
+    for w in candidates:
         if w not in seen:
             out.append(w)
             seen.add(w)
@@ -56,13 +51,6 @@ def parse_wallets(raw: str) -> list[str]:
 
 
 def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
-    """
-    Robust JSON-RPC POST with retry/backoff and clear error messages.
-    Handles:
-      - HTTP 429
-      - transient 5xx
-      - RPC {"error": ...}
-    """
     last_err = None
 
     for attempt in range(1, retries + 1):
@@ -82,8 +70,7 @@ def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
             except json.JSONDecodeError:
                 raise Exception(f"RPC returned non-JSON response: {raw[:400]}")
 
-            # RPC-level error (even if HTTP 200)
-            if isinstance(data, dict) and "error" in data and data["error"] is not None:
+            if isinstance(data, dict) and data.get("error") is not None:
                 raise Exception(f"Solana RPC error: {data['error']}")
 
             if not isinstance(data, dict):
@@ -92,7 +79,6 @@ def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
             return data
 
         except urllib.error.HTTPError as e:
-            # Read body for better diagnostics
             body = ""
             try:
                 body = e.read().decode("utf-8", errors="replace")
@@ -100,14 +86,13 @@ def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
                 body = ""
             last_err = f"HTTPError {e.code}: {e.reason}. Body: {body[:400]}"
 
-            # Retry only for rate limit / transient
             if e.code not in (429, 500, 502, 503, 504):
                 raise Exception(f"RPC hard failure: {last_err}")
 
         except Exception as e:
             last_err = str(e)
 
-        # Backoff with jitter
+        # exponential backoff + jitter
         sleep_s = min(2 ** attempt, 30) + random.uniform(0.0, 0.8)
         time.sleep(sleep_s)
 
@@ -115,12 +100,7 @@ def rpc_post(payload: dict, *, retries: int = 8, timeout: int = 30) -> dict:
 
 
 def rpc_get_sol_balance(wallet: str) -> float:
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getBalance",
-        "params": [wallet],
-    }
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]}
     res = rpc_post(payload)
     if "result" not in res or res["result"] is None or "value" not in res["result"]:
         raise Exception(f"RPC missing result for getBalance({wallet}). Response: {res}")
@@ -149,7 +129,6 @@ def rpc_get_usdc_balance(wallet: str) -> float:
             if amt is not None:
                 total += float(amt)
         except Exception:
-            # ignore malformed token accounts rather than killing the run
             continue
 
     return total
@@ -202,8 +181,8 @@ def main():
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
         raise Exception(
-            "No wallets found in WALLETS_CSV. "
-            "Your secret must be comma/newline separated Solana addresses."
+            "No valid Solana pubkeys found in WALLETS_CSV. "
+            "Make sure the secret contains Solana addresses."
         )
 
     per_wallet = []
@@ -211,8 +190,15 @@ def main():
     total_usdc = 0.0
 
     for w in wallets:
-        sol_raw = rpc_get_sol_balance(w)
-        usdc_raw = rpc_get_usdc_balance(w)
+        try:
+            sol_raw = rpc_get_sol_balance(w)
+        except Exception as e:
+            raise Exception(f"SOL balance failed for wallet {w}: {e}")
+
+        try:
+            usdc_raw = rpc_get_usdc_balance(w)
+        except Exception as e:
+            raise Exception(f"USDC balance failed for wallet {w}: {e}")
 
         sol = r2(sol_raw)
         usdc = r2(usdc_raw)
