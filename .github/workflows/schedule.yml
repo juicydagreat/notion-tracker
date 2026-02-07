@@ -10,19 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Run
+
+      - name: Run tracker
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
           NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
           WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
-          # Optional overrides if your title column names differ:
-          # TITLE_PROP_PERWALLET: Wallet
-          # TOTAL_TITLE_PROP: Name
-          # SOLANA_RPC_URL: https://api.mainnet-beta.solana.com
-          run: |
-            python sol_multi_to_notion.py
-
+        run: |
+          python sol_multi_to_notion.py
