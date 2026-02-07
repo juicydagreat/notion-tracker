@@ -2,26 +2,28 @@ name: Solana Tracker (Daily 3am AEST)
 
 on:
   schedule:
-    - cron: "0 17 * * *"   # 03:00 AEST daily (AEST = UTC+10 → 17:00 UTC previous day)
-  workflow_dispatch: {}     # keep manual run available
+    - cron: "0 17 * * *"   # 03:00 AEST (UTC+10)
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Run tracker
-    env:
-      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-      NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
-      NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
-      WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
-      SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
-
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
+          NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
+          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
         run: |
           python sol_multi_to_notion.py
