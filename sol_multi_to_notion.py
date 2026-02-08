@@ -1,52 +1,62 @@
-#!/usr/bin/env python3
-import json
-import os
-import sys
-import time
-import random
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
+# sol_multi_to_notion.py
+# Writes daily SOL + USDC balances to Notion (Per Wallet + Daily Total),
+# computes deltas, and writes SOL Baseline once per day (does not overwrite if already set).
 
-# -----------------------------
-# Env
-# -----------------------------
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
-NOTION_DB_DAILYTOTAL = os.environ.get("NOTION_DB_DAILYTOTAL", "").strip()
+import os, sys, json, time, random, urllib.request, urllib.error
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import Optional, Tuple
 
-DATE_PROP = os.environ.get("DATE_PROP", "Date").strip()
-TITLE_PROP_DAILY = os.environ.get("TOTAL_TITLE_PROP", "Name").strip()
+# ----------------------------
+# ENV / CONFIG
+# ----------------------------
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
+DB_PER = os.getenv("NOTION_DB_PERWALLET", "").strip()
+DB_TOTAL = os.getenv("NOTION_DB_DAILYTOTAL", "").strip()
+WALLETS_RAW = os.getenv("WALLETS_CSV", "")
 
-# Must match your Notion column name EXACTLY
-BASELINE_PROP = os.environ.get("BASELINE_PROP", "SOL Baseline").strip()
+RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 
-WALLETS_CSV = os.environ.get("WALLETS_CSV", "").strip()
-SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+# Notion property names (override only if you renamed columns)
+TITLE_PROP_PERWALLET = os.getenv("TITLE_PROP_PERWALLET", "Wallet").strip()
+TOTAL_TITLE_PROP = os.getenv("TOTAL_TITLE_PROP", "Name").strip()
+DATE_PROP = os.getenv("DATE_PROP", "Date").strip()
 
-NOTION_VERSION = os.environ.get("NOTION_VERSION", "2022-06-28").strip()
+# Numeric property names (must exist as Number in Notion)
+PROP_SOL_END = os.getenv("PROP_SOL_END", "End Balance").strip()
+PROP_SOL_DELTA = os.getenv("PROP_SOL_DELTA", "Delta").strip()
+PROP_USDC_END = os.getenv("PROP_USDC_END", "USDC End Balance").strip()
+PROP_USDC_DELTA = os.getenv("PROP_USDC_DELTA", "USDC Delta").strip()
+PROP_SOL_BASELINE = os.getenv("PROP_SOL_BASELINE", "SOL Baseline").strip()
 
-RPC_TIMEOUT_SECS = int(os.environ.get("RPC_TIMEOUT_SECS", "30"))
-RPC_RETRIES = int(os.environ.get("RPC_RETRIES", "6"))
+# USDC mint (mainnet)
+USDC_MINT = os.getenv("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
 
-NOTION_TIMEOUT_SECS = int(os.environ.get("NOTION_TIMEOUT_SECS", "30"))
-NOTION_RETRIES = int(os.environ.get("NOTION_RETRIES", "5"))
+# Local date label (Sydney)
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Australia/Sydney"))
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def die(msg: str, code: int = 1) -> None:
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28").strip()
 
-def _sleep(attempt: int) -> None:
-    # exponential backoff + jitter
-    time.sleep(min((1.7 ** attempt) + random.uniform(0.0, 0.6), 20.0))
+RPC_TIMEOUT = int(os.getenv("RPC_TIMEOUT", "30"))
+RPC_RETRIES = int(os.getenv("RPC_RETRIES", "8"))
+NOTION_TIMEOUT = int(os.getenv("NOTION_TIMEOUT", "30"))
+NOTION_RETRIES = int(os.getenv("NOTION_RETRIES", "6"))
 
-def http_json(url: str, method: str, headers: dict, body_obj=None, timeout: int = 30, retries: int = 5):
-    data = None
-    if body_obj is not None:
-        data = json.dumps(body_obj).encode("utf-8")
+# ----------------------------
+# UTILS
+# ----------------------------
+def fail(msg: str):
+    print(f"ERROR: {msg}")
+    sys.exit(1)
 
+def r2(x: Optional[float]) -> Optional[float]:
+    return None if x is None else round(float(x), 2)
+
+def backoff_sleep(attempt: int):
+    time.sleep(min((1.8 ** attempt) + random.uniform(0.0, 0.6), 20.0))
+
+def http_json(url: str, method: str, headers: dict, body: Optional[dict], timeout: int, retries: int) -> dict:
+    data = None if body is None else json.dumps(body).encode("utf-8")
     last_err = None
     for attempt in range(retries):
         try:
@@ -57,225 +67,346 @@ def http_json(url: str, method: str, headers: dict, body_obj=None, timeout: int 
                 raw = resp.read().decode("utf-8", errors="replace")
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
-            raw = ""
+            detail = ""
             try:
-                raw = e.read().decode("utf-8", errors="replace")
+                detail = e.read().decode("utf-8", errors="replace")
             except Exception:
                 pass
-
-            last_err = f"HTTP {e.code} {e.reason}: {raw}"
-            # Retry only transient errors
+            last_err = f"HTTP {e.code} {e.reason}: {detail}"
+            # retry transient
             if e.code in (408, 425, 429, 500, 502, 503, 504):
-                _sleep(attempt)
+                backoff_sleep(attempt)
                 continue
-
-            # Non-transient: raise with body included
             raise Exception(last_err)
         except Exception as e:
             last_err = str(e)
-            _sleep(attempt)
-
-    raise Exception(f"HTTP request failed after retries. Last error: {last_err}")
+            backoff_sleep(attempt)
+    raise Exception(f"HTTP failed after retries. Last error: {last_err}")
 
 def notion_headers() -> dict:
-    if not NOTION_TOKEN:
-        die("Missing NOTION_TOKEN env var.")
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
+        "Notion-Version": NOTION_VERSION,
     }
 
 def parse_wallets(raw: str) -> list[str]:
-    if not raw:
-        return []
+    # Accept commas + newlines, strip whitespace, dedupe
     parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
     out, seen = [], set()
     for p in parts:
         if not p:
-            continue
-        if len(p) < 32 or len(p) > 60:
             continue
         if p not in seen:
             seen.add(p)
             out.append(p)
     return out
 
+def today_local_iso() -> str:
+    return datetime.now(LOCAL_TZ).date().isoformat()
+
+# ----------------------------
+# SOLANA RPC
+# ----------------------------
 def rpc_post(payload: dict) -> dict:
     return http_json(
-        url=SOLANA_RPC_URL,
+        url=RPC_URL,
         method="POST",
         headers={"Content-Type": "application/json"},
-        body_obj=payload,
-        timeout=RPC_TIMEOUT_SECS,
+        body=payload,
+        timeout=RPC_TIMEOUT,
         retries=RPC_RETRIES,
     )
 
-def rpc_get_total_sol(wallets: list[str]) -> float:
-    total_lamports = 0
-    chunk_size = 100
-    for i in range(0, len(wallets), chunk_size):
-        chunk = wallets[i:i + chunk_size]
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [chunk, {"encoding": "base64"}],
-        }
-        res = rpc_post(payload)
-        if "error" in res:
-            raise Exception(f"Solana RPC error: {res['error']}")
-        vals = res.get("result", {}).get("value")
-        if vals is None:
-            raise Exception(f"Unexpected RPC response: {res}")
+def rpc_get_sol_balance(wallet: str) -> float:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]}
+    res = rpc_post(payload)
+    if "error" in res:
+        raise Exception(f"RPC error getBalance({wallet}): {res['error']}")
+    if "result" not in res or "value" not in res["result"]:
+        raise Exception(f"RPC bad response getBalance({wallet}): {res}")
+    return res["result"]["value"] / 1e9
 
-        for acct in vals:
-            if acct and isinstance(acct, dict):
-                lamports = acct.get("lamports", 0)
-                if isinstance(lamports, int):
-                    total_lamports += lamports
+def rpc_get_usdc_balance(wallet: str) -> float:
+    # Sums all USDC token accounts for this owner
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            wallet,
+            {"mint": USDC_MINT},
+            {"encoding": "jsonParsed"},
+        ],
+    }
+    res = rpc_post(payload)
+    if "error" in res:
+        raise Exception(f"RPC error getTokenAccountsByOwner({wallet}): {res['error']}")
+    val = res.get("result", {}).get("value")
+    if val is None:
+        raise Exception(f"RPC bad response getTokenAccountsByOwner({wallet}): {res}")
 
-        time.sleep(0.15)
+    total = 0.0
+    for acc in val:
+        try:
+            info = acc["account"]["data"]["parsed"]["info"]
+            ta = info["tokenAmount"]
+            ui_amt = ta.get("uiAmount")
+            if ui_amt is not None:
+                total += float(ui_amt)
+            else:
+                amt = int(ta.get("amount", "0"))
+                dec = int(ta.get("decimals", 0))
+                total += (amt / (10 ** dec)) if dec else float(amt)
+        except Exception:
+            continue
+    return total
 
-    return total_lamports / 1e9
-
+# ----------------------------
+# NOTION
+# ----------------------------
 def notion_get_database(db_id: str) -> dict:
-    url = f"https://api.notion.com/v1/databases/{db_id}"
     return http_json(
-        url=url,
+        url=f"https://api.notion.com/v1/databases/{db_id}",
         method="GET",
         headers=notion_headers(),
-        body_obj=None,
-        timeout=NOTION_TIMEOUT_SECS,
+        body=None,
+        timeout=NOTION_TIMEOUT,
         retries=NOTION_RETRIES,
     )
 
-def notion_query_today_page(db_id: str, date_prop: str, yyyy_mm_dd: str) -> dict | None:
-    url = f"https://api.notion.com/v1/databases/{db_id}/query"
-    payload = {
-        "filter": {"property": date_prop, "date": {"equals": yyyy_mm_dd}},
-        "page_size": 1,
-    }
-    res = http_json(
-        url=url,
+def notion_query(db_id: str, body: dict) -> dict:
+    return http_json(
+        url=f"https://api.notion.com/v1/databases/{db_id}/query",
         method="POST",
         headers=notion_headers(),
-        body_obj=payload,
-        timeout=NOTION_TIMEOUT_SECS,
+        body=body,
+        timeout=NOTION_TIMEOUT,
         retries=NOTION_RETRIES,
     )
+
+def notion_create_page(db_id: str, props: dict) -> dict:
+    return http_json(
+        url="https://api.notion.com/v1/pages",
+        method="POST",
+        headers=notion_headers(),
+        body={"parent": {"database_id": db_id}, "properties": props},
+        timeout=NOTION_TIMEOUT,
+        retries=NOTION_RETRIES,
+    )
+
+def notion_update_page(page_id: str, props: dict) -> dict:
+    return http_json(
+        url=f"https://api.notion.com/v1/pages/{page_id}",
+        method="PATCH",
+        headers=notion_headers(),
+        body={"properties": props},
+        timeout=NOTION_TIMEOUT,
+        retries=NOTION_RETRIES,
+    )
+
+def get_number(page: dict, prop: str) -> Optional[float]:
+    try:
+        p = page["properties"][prop]
+        if p.get("type") == "number":
+            return p.get("number")
+    except Exception:
+        return None
+    return None
+
+def get_page_id(page: dict) -> str:
+    return page.get("id")
+
+def find_total_page_for_date(db_id: str, date_iso: str) -> Optional[dict]:
+    body = {
+        "filter": {"property": DATE_PROP, "date": {"equals": date_iso}},
+        "page_size": 1
+    }
+    res = notion_query(db_id, body)
     results = res.get("results", [])
     return results[0] if results else None
 
-def notion_get_number_prop(page: dict, prop_name: str):
-    p = page.get("properties", {}).get(prop_name)
-    if not p:
-        return None
-    if p.get("type") == "number":
-        return p.get("number")
-    return None
-
-def notion_update_page_number(page_id: str, prop_name: str, number_value: float):
-    url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {"properties": {prop_name: {"number": number_value}}}
-    return http_json(
-        url=url,
-        method="PATCH",
-        headers=notion_headers(),
-        body_obj=payload,
-        timeout=NOTION_TIMEOUT_SECS,
-        retries=NOTION_RETRIES,
-    )
-
-def notion_create_page_daily(db_id: str, title_prop: str, title_text: str,
-                            date_prop: str, yyyy_mm_dd: str,
-                            baseline_prop: str, baseline_value: float):
-    url = "https://api.notion.com/v1/pages"
-    payload = {
-        "parent": {"database_id": db_id},
-        "properties": {
-            title_prop: {"title": [{"type": "text", "text": {"content": title_text}}]},
-            date_prop: {"date": {"start": yyyy_mm_dd}},
-            baseline_prop: {"number": baseline_value},
-        },
+def find_latest_total_before_date(db_id: str, date_iso: str) -> Optional[dict]:
+    # Find most recent page with Date < date_iso
+    body = {
+        "filter": {"property": DATE_PROP, "date": {"before": date_iso}},
+        "sorts": [{"property": DATE_PROP, "direction": "descending"}],
+        "page_size": 1
     }
-    return http_json(
-        url=url,
-        method="POST",
-        headers=notion_headers(),
-        body_obj=payload,
-        timeout=NOTION_TIMEOUT_SECS,
-        retries=NOTION_RETRIES,
-    )
+    res = notion_query(db_id, body)
+    results = res.get("results", [])
+    return results[0] if results else None
 
-def today_yyyy_mm_dd() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+def find_per_wallet_page_for_date(db_id: str, wallet: str, date_iso: str) -> Optional[dict]:
+    body = {
+        "filter": {
+            "and": [
+                {"property": TITLE_PROP_PERWALLET, "title": {"equals": wallet}},
+                {"property": DATE_PROP, "date": {"equals": date_iso}},
+            ]
+        },
+        "page_size": 1
+    }
+    res = notion_query(db_id, body)
+    results = res.get("results", [])
+    return results[0] if results else None
 
-# -----------------------------
-# Main
-# -----------------------------
-def main():
-    if not NOTION_DB_DAILYTOTAL:
-        die("Missing NOTION_DB_DAILYTOTAL env var.")
+def find_latest_per_wallet_before_date(db_id: str, wallet: str, date_iso: str) -> Optional[dict]:
+    body = {
+        "filter": {
+            "and": [
+                {"property": TITLE_PROP_PERWALLET, "title": {"equals": wallet}},
+                {"property": DATE_PROP, "date": {"before": date_iso}},
+            ]
+        },
+        "sorts": [{"property": DATE_PROP, "direction": "descending"}],
+        "page_size": 1
+    }
+    res = notion_query(db_id, body)
+    results = res.get("results", [])
+    return results[0] if results else None
 
-    wallets = parse_wallets(WALLETS_CSV)
-    if not wallets:
-        die("No wallets found in WALLETS_CSV.")
-
-    # 0) Validate Notion DB schema BEFORE doing anything
-    db = notion_get_database(NOTION_DB_DAILYTOTAL)
+def validate_db_schema(db_id: str, required: list[Tuple[str, str]]):
+    db = notion_get_database(db_id)
     props = db.get("properties", {})
-    if BASELINE_PROP not in props:
+    missing = []
+    wrong_type = []
+    for name, want_type in required:
+        if name not in props:
+            missing.append(name)
+        else:
+            got = props[name].get("type")
+            if got != want_type:
+                wrong_type.append((name, got, want_type))
+    if missing or wrong_type:
         available = ", ".join(sorted(props.keys()))
-        die(
-            f"Notion DB does NOT have a property named exactly '{BASELINE_PROP}'.\n"
-            f"Available properties in this DB are:\n{available}\n\n"
-            f"Fix: rename the Notion column to '{BASELINE_PROP}' OR set a GitHub secret BASELINE_PROP to the exact column name."
-        )
+        msg = []
+        if missing:
+            msg.append(f"Missing properties in DB {db_id}: {missing}")
+        if wrong_type:
+            msg.append(f"Wrong property types in DB {db_id}: {wrong_type}")
+        msg.append(f"Available properties: {available}")
+        fail("\n".join(msg))
 
-    baseline_type = props[BASELINE_PROP].get("type")
-    if baseline_type != "number":
-        die(
-            f"Notion property '{BASELINE_PROP}' exists but is type '{baseline_type}', not 'number'.\n"
-            f"Fix: change '{BASELINE_PROP}' column type to Number in Notion."
-        )
+# ----------------------------
+# MAIN
+# ----------------------------
+def main():
+    if not NOTION_TOKEN:
+        fail("NOTION_TOKEN missing")
+    if not DB_PER:
+        fail("NOTION_DB_PERWALLET missing")
+    if not DB_TOTAL:
+        fail("NOTION_DB_DAILYTOTAL missing")
 
-    yyyy_mm_dd = today_yyyy_mm_dd()
+    wallets = parse_wallets(WALLETS_RAW)
+    if not wallets:
+        fail("WALLETS_CSV is empty or invalid")
 
-    # 1) Find today's page
-    today_page = notion_query_today_page(NOTION_DB_DAILYTOTAL, DATE_PROP, yyyy_mm_dd)
+    if not RPC_URL.startswith("https://"):
+        fail(f"SOLANA_RPC_URL must be https:// (got {RPC_URL})")
 
-    # 2) If exists and already set -> skip
-    if today_page:
-        page_id = today_page.get("id")
-        existing_baseline = notion_get_number_prop(today_page, BASELINE_PROP)
-        if existing_baseline is not None:
-            print(f"Baseline already set for {yyyy_mm_dd}: {existing_baseline}. Skipping.")
-            return
+    # Validate Notion schemas so we fail fast with a clear message
+    validate_db_schema(DB_TOTAL, [
+        (TOTAL_TITLE_PROP, "title"),
+        (DATE_PROP, "date"),
+        (PROP_SOL_END, "number"),
+        (PROP_SOL_DELTA, "number"),
+        (PROP_USDC_END, "number"),
+        (PROP_USDC_DELTA, "number"),
+        (PROP_SOL_BASELINE, "number"),
+    ])
+    validate_db_schema(DB_PER, [
+        (TITLE_PROP_PERWALLET, "title"),
+        (DATE_PROP, "date"),
+        (PROP_SOL_END, "number"),
+        (PROP_SOL_DELTA, "number"),
+        (PROP_USDC_END, "number"),
+        (PROP_USDC_DELTA, "number"),
+    ])
 
-        # 3) Compute baseline and set it only
-        total_sol = rpc_get_total_sol(wallets)
-        total_sol_rounded = round(float(total_sol), 2)
+    date_iso = today_local_iso()
 
-        notion_update_page_number(page_id, BASELINE_PROP, total_sol_rounded)
-        print(f"Set SOL Baseline for {yyyy_mm_dd} to {total_sol_rounded} (updated existing page).")
-        return
+    # Fetch balances
+    per_rows = []
+    for w in wallets:
+        sol = r2(rpc_get_sol_balance(w))
+        # small pause to reduce RPC spikes
+        time.sleep(0.12)
+        usdc = r2(rpc_get_usdc_balance(w))
+        time.sleep(0.12)
+        per_rows.append((w, sol, usdc))
 
-    # 4) Create minimal page if missing
-    total_sol = rpc_get_total_sol(wallets)
-    total_sol_rounded = round(float(total_sol), 2)
-    title_text = f"{total_sol_rounded:.2f} SOL"
+    total_sol = r2(sum(sol for _, sol, _ in per_rows))
+    total_usdc = r2(sum(usdc for _, _, usdc in per_rows))
 
-    notion_create_page_daily(
-        db_id=NOTION_DB_DAILYTOTAL,
-        title_prop=TITLE_PROP_DAILY,
-        title_text=title_text,
-        date_prop=DATE_PROP,
-        yyyy_mm_dd=yyyy_mm_dd,
-        baseline_prop=BASELINE_PROP,
-        baseline_value=total_sol_rounded,
-    )
-    print(f"Created today's page {yyyy_mm_dd} with SOL Baseline {total_sol_rounded}.")
+    # Compute total deltas vs previous day record (latest before today)
+    prev_total_page = find_latest_total_before_date(DB_TOTAL, date_iso)
+    prev_total_sol = get_number(prev_total_page, PROP_SOL_END) if prev_total_page else None
+    prev_total_usdc = get_number(prev_total_page, PROP_USDC_END) if prev_total_page else None
+
+    total_sol_delta = None if prev_total_sol is None else r2(total_sol - float(prev_total_sol))
+    total_usdc_delta = None if prev_total_usdc is None else r2(total_usdc - float(prev_total_usdc))
+
+    # Upsert DAILY TOTAL page for today
+    today_total_page = find_total_page_for_date(DB_TOTAL, date_iso)
+
+    # Baseline write-once logic (only set if empty)
+    baseline_to_set = total_sol  # baseline is “total SOL at time baseline first written”
+    existing_baseline = get_number(today_total_page, PROP_SOL_BASELINE) if today_total_page else None
+    should_set_baseline = (existing_baseline is None)
+
+    total_props_update = {
+        TOTAL_TITLE_PROP: {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},
+        DATE_PROP: {"date": {"start": date_iso}},
+        PROP_SOL_END: {"number": total_sol},
+        PROP_SOL_DELTA: {"number": total_sol_delta},
+        PROP_USDC_END: {"number": total_usdc},
+        PROP_USDC_DELTA: {"number": total_usdc_delta},
+    }
+    if should_set_baseline:
+        total_props_update[PROP_SOL_BASELINE] = {"number": baseline_to_set}
+
+    if today_total_page:
+        notion_update_page(get_page_id(today_total_page), total_props_update)
+    else:
+        # Create needs baseline too (set it on create)
+        if PROP_SOL_BASELINE not in total_props_update:
+            total_props_update[PROP_SOL_BASELINE] = {"number": baseline_to_set}
+        notion_create_page(DB_TOTAL, total_props_update)
+
+    # Upsert PER WALLET rows for today (and compute per-wallet deltas)
+    for w, sol, usdc in per_rows:
+        prev_wallet_page = find_latest_per_wallet_before_date(DB_PER, w, date_iso)
+        prev_w_sol = get_number(prev_wallet_page, PROP_SOL_END) if prev_wallet_page else None
+        prev_w_usdc = get_number(prev_wallet_page, PROP_USDC_END) if prev_wallet_page else None
+
+        w_sol_delta = None if prev_w_sol is None else r2(sol - float(prev_w_sol))
+        w_usdc_delta = None if prev_w_usdc is None else r2(usdc - float(prev_w_usdc))
+
+        wallet_props = {
+            TITLE_PROP_PERWALLET: {"title": [{"text": {"content": w}}]},
+            DATE_PROP: {"date": {"start": date_iso}},
+            PROP_SOL_END: {"number": sol},
+            PROP_SOL_DELTA: {"number": w_sol_delta},
+            PROP_USDC_END: {"number": usdc},
+            PROP_USDC_DELTA: {"number": w_usdc_delta},
+        }
+
+        today_wallet_page = find_per_wallet_page_for_date(DB_PER, w, date_iso)
+        if today_wallet_page:
+            notion_update_page(get_page_id(today_wallet_page), wallet_props)
+        else:
+            notion_create_page(DB_PER, wallet_props)
+
+    # Log
+    print(f"{date_iso} | wallets={len(per_rows)}")
+    print(f"TOTAL SOL={total_sol:.2f}  Δ={('None' if total_sol_delta is None else f'{total_sol_delta:+.2f}')}")
+    print(f"TOTAL USDC={total_usdc:.2f}  Δ={('None' if total_usdc_delta is None else f'{total_usdc_delta:+.2f}')}")
+    if should_set_baseline:
+        print(f"SOL Baseline set: {baseline_to_set:.2f}")
+    else:
+        print(f"SOL Baseline already set: {existing_baseline}")
 
 if __name__ == "__main__":
     main()
