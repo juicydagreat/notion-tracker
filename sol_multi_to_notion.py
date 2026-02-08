@@ -1,58 +1,35 @@
 #!/usr/bin/env python3
-"""
-sol_multi_to_notion.py
-
-Purpose:
-- Compute TOTAL SOL across all wallets in WALLETS_CSV (comma/newline separated)
-- Write it into your existing Notion DAILY TOTAL database as a "SOL Baseline" number
-- Only writes once per day:
-    - If today's page exists AND baseline is already set -> do nothing
-    - If today's page exists AND baseline is empty -> set it
-    - If today's page does not exist -> create it (minimal) and set baseline
-
-This script intentionally DOES NOT update any other fields.
-No external dependencies (no requests). Uses urllib only.
-"""
-
 import json
 import os
 import sys
 import time
+import random
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
 # -----------------------------
-# Config via env
+# Env
 # -----------------------------
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 NOTION_DB_DAILYTOTAL = os.environ.get("NOTION_DB_DAILYTOTAL", "").strip()
 
-# Your existing Notion property names (defaults match your prior convention)
 DATE_PROP = os.environ.get("DATE_PROP", "Date").strip()
 TITLE_PROP_DAILY = os.environ.get("TOTAL_TITLE_PROP", "Name").strip()
 
-# The new baseline field (you must add this property in Notion as a Number)
+# Must match your Notion column name EXACTLY
 BASELINE_PROP = os.environ.get("BASELINE_PROP", "SOL Baseline").strip()
 
-# Wallet input (secret)
 WALLETS_CSV = os.environ.get("WALLETS_CSV", "").strip()
-
-# Solana RPC (secret recommended)
 SOLANA_RPC_URL = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 
-# Safety knobs
+NOTION_VERSION = os.environ.get("NOTION_VERSION", "2022-06-28").strip()
+
 RPC_TIMEOUT_SECS = int(os.environ.get("RPC_TIMEOUT_SECS", "30"))
 RPC_RETRIES = int(os.environ.get("RPC_RETRIES", "6"))
-RPC_BACKOFF_BASE = float(os.environ.get("RPC_BACKOFF_BASE", "1.6"))  # exponential
-RPC_BACKOFF_JITTER = float(os.environ.get("RPC_BACKOFF_JITTER", "0.25"))
 
 NOTION_TIMEOUT_SECS = int(os.environ.get("NOTION_TIMEOUT_SECS", "30"))
 NOTION_RETRIES = int(os.environ.get("NOTION_RETRIES", "5"))
-NOTION_BACKOFF_BASE = float(os.environ.get("NOTION_BACKOFF_BASE", "1.6"))
-NOTION_BACKOFF_JITTER = float(os.environ.get("NOTION_BACKOFF_JITTER", "0.25"))
-
-NOTION_VERSION = os.environ.get("NOTION_VERSION", "2022-06-28").strip()
 
 # -----------------------------
 # Helpers
@@ -61,14 +38,11 @@ def die(msg: str, code: int = 1) -> None:
     print(msg, file=sys.stderr)
     sys.exit(code)
 
-def _sleep_backoff(attempt: int, base: float, jitter: float) -> None:
-    # Exponential backoff with small jitter
-    delay = (base ** attempt)
-    delay = delay * (1.0 + (jitter * (2.0 * (time.time() % 1.0) - 1.0)))  # deterministic-ish jitter
-    time.sleep(max(0.2, min(delay, 30.0)))
+def _sleep(attempt: int) -> None:
+    # exponential backoff + jitter
+    time.sleep(min((1.7 ** attempt) + random.uniform(0.0, 0.6), 20.0))
 
-def http_json(url: str, method: str, headers: dict, body_obj=None, timeout: int = 30, retries: int = 5,
-              backoff_base: float = 1.6, backoff_jitter: float = 0.25):
+def http_json(url: str, method: str, headers: dict, body_obj=None, timeout: int = 30, retries: int = 5):
     data = None
     if body_obj is not None:
         data = json.dumps(body_obj).encode("utf-8")
@@ -80,32 +54,32 @@ def http_json(url: str, method: str, headers: dict, body_obj=None, timeout: int 
             for k, v in headers.items():
                 req.add_header(k, v)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8")
-                if not raw:
-                    return {}
-                return json.loads(raw)
+                raw = resp.read().decode("utf-8", errors="replace")
+                return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
-            # Try to read JSON error details
+            raw = ""
             try:
-                raw = e.read().decode("utf-8")
+                raw = e.read().decode("utf-8", errors="replace")
             except Exception:
-                raw = ""
-            last_err = f"HTTP {e.code} {e.reason} {raw}".strip()
-            # Retry on common transient codes
+                pass
+
+            last_err = f"HTTP {e.code} {e.reason}: {raw}"
+            # Retry only transient errors
             if e.code in (408, 425, 429, 500, 502, 503, 504):
-                _sleep_backoff(attempt, backoff_base, backoff_jitter)
+                _sleep(attempt)
                 continue
-            raise
+
+            # Non-transient: raise with body included
+            raise Exception(last_err)
         except Exception as e:
             last_err = str(e)
-            _sleep_backoff(attempt, backoff_base, backoff_jitter)
-            continue
+            _sleep(attempt)
 
     raise Exception(f"HTTP request failed after retries. Last error: {last_err}")
 
 def notion_headers() -> dict:
     if not NOTION_TOKEN:
-        die("Missing NOTION_TOKEN env var")
+        die("Missing NOTION_TOKEN env var.")
     return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
@@ -113,22 +87,14 @@ def notion_headers() -> dict:
     }
 
 def parse_wallets(raw: str) -> list[str]:
-    """
-    Accepts comma/newline separated wallet pubkeys.
-    Trims whitespace. Removes empty entries. De-dupes while preserving order.
-    """
     if not raw:
         return []
-    # Replace newlines with commas, split, strip
     parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
-    out = []
-    seen = set()
+    out, seen = [], set()
     for p in parts:
         if not p:
             continue
-        # Basic sanity: Solana pubkeys are base58, usually length 32-44 chars.
         if len(p) < 32 or len(p) > 60:
-            # Don't hard fail; just skip obviously broken items
             continue
         if p not in seen:
             seen.add(p)
@@ -143,18 +109,10 @@ def rpc_post(payload: dict) -> dict:
         body_obj=payload,
         timeout=RPC_TIMEOUT_SECS,
         retries=RPC_RETRIES,
-        backoff_base=RPC_BACKOFF_BASE,
-        backoff_jitter=RPC_BACKOFF_JITTER,
     )
 
 def rpc_get_total_sol(wallets: list[str]) -> float:
-    """
-    Uses getMultipleAccounts (chunked) to reduce rate limits.
-    Returns total SOL across wallets.
-    """
     total_lamports = 0
-
-    # getMultipleAccounts supports up to 100 accounts per call commonly
     chunk_size = 100
     for i in range(0, len(wallets), chunk_size):
         chunk = wallets[i:i + chunk_size]
@@ -165,36 +123,37 @@ def rpc_get_total_sol(wallets: list[str]) -> float:
             "params": [chunk, {"encoding": "base64"}],
         }
         res = rpc_post(payload)
-
         if "error" in res:
             raise Exception(f"Solana RPC error: {res['error']}")
-        if "result" not in res or "value" not in res["result"]:
+        vals = res.get("result", {}).get("value")
+        if vals is None:
             raise Exception(f"Unexpected RPC response: {res}")
 
-        values = res["result"]["value"]
-        # Each item can be None (account not found) or dict with 'lamports'
-        for acct in values:
+        for acct in vals:
             if acct and isinstance(acct, dict):
                 lamports = acct.get("lamports", 0)
                 if isinstance(lamports, int):
                     total_lamports += lamports
 
-        # Tiny pause to be polite (usually unnecessary with chunking, but safe)
-        time.sleep(0.2)
+        time.sleep(0.15)
 
     return total_lamports / 1e9
 
+def notion_get_database(db_id: str) -> dict:
+    url = f"https://api.notion.com/v1/databases/{db_id}"
+    return http_json(
+        url=url,
+        method="GET",
+        headers=notion_headers(),
+        body_obj=None,
+        timeout=NOTION_TIMEOUT_SECS,
+        retries=NOTION_RETRIES,
+    )
+
 def notion_query_today_page(db_id: str, date_prop: str, yyyy_mm_dd: str) -> dict | None:
-    """
-    Query the database for a page where Date == yyyy-mm-dd.
-    Returns the first matching page object, else None.
-    """
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     payload = {
-        "filter": {
-            "property": date_prop,
-            "date": {"equals": yyyy_mm_dd},
-        },
+        "filter": {"property": date_prop, "date": {"equals": yyyy_mm_dd}},
         "page_size": 1,
     }
     res = http_json(
@@ -204,35 +163,21 @@ def notion_query_today_page(db_id: str, date_prop: str, yyyy_mm_dd: str) -> dict
         body_obj=payload,
         timeout=NOTION_TIMEOUT_SECS,
         retries=NOTION_RETRIES,
-        backoff_base=NOTION_BACKOFF_BASE,
-        backoff_jitter=NOTION_BACKOFF_JITTER,
     )
     results = res.get("results", [])
     return results[0] if results else None
 
 def notion_get_number_prop(page: dict, prop_name: str):
-    """
-    Extract a Notion number property value from a page.
-    Returns:
-      - float/int value if set
-      - None if missing or null
-    """
-    props = page.get("properties", {})
-    p = props.get(prop_name)
+    p = page.get("properties", {}).get(prop_name)
     if not p:
         return None
-    # number properties look like: {"type":"number","number": 12.34}
     if p.get("type") == "number":
         return p.get("number")
     return None
 
 def notion_update_page_number(page_id: str, prop_name: str, number_value: float):
     url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {
-        "properties": {
-            prop_name: {"number": number_value}
-        }
-    }
+    payload = {"properties": {prop_name: {"number": number_value}}}
     return http_json(
         url=url,
         method="PATCH",
@@ -240,8 +185,6 @@ def notion_update_page_number(page_id: str, prop_name: str, number_value: float)
         body_obj=payload,
         timeout=NOTION_TIMEOUT_SECS,
         retries=NOTION_RETRIES,
-        backoff_base=NOTION_BACKOFF_BASE,
-        backoff_jitter=NOTION_BACKOFF_JITTER,
     )
 
 def notion_create_page_daily(db_id: str, title_prop: str, title_text: str,
@@ -251,16 +194,10 @@ def notion_create_page_daily(db_id: str, title_prop: str, title_text: str,
     payload = {
         "parent": {"database_id": db_id},
         "properties": {
-            title_prop: {
-                "title": [{"type": "text", "text": {"content": title_text}}]
-            },
-            date_prop: {
-                "date": {"start": yyyy_mm_dd}
-            },
-            baseline_prop: {
-                "number": baseline_value
-            }
-        }
+            title_prop: {"title": [{"type": "text", "text": {"content": title_text}}]},
+            date_prop: {"date": {"start": yyyy_mm_dd}},
+            baseline_prop: {"number": baseline_value},
+        },
     }
     return http_json(
         url=url,
@@ -269,14 +206,9 @@ def notion_create_page_daily(db_id: str, title_prop: str, title_text: str,
         body_obj=payload,
         timeout=NOTION_TIMEOUT_SECS,
         retries=NOTION_RETRIES,
-        backoff_base=NOTION_BACKOFF_BASE,
-        backoff_jitter=NOTION_BACKOFF_JITTER,
     )
 
-def today_yyyy_mm_dd_local() -> str:
-    # GitHub runner uses UTC by default; this makes the date stable.
-    # If you need AEST date boundaries, schedule your workflow at the right UTC time
-    # (which you already do). So storing UTC "today" is fine.
+def today_yyyy_mm_dd() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 # -----------------------------
@@ -284,27 +216,44 @@ def today_yyyy_mm_dd_local() -> str:
 # -----------------------------
 def main():
     if not NOTION_DB_DAILYTOTAL:
-        die("Missing NOTION_DB_DAILYTOTAL env var (your calendar database id).")
+        die("Missing NOTION_DB_DAILYTOTAL env var.")
 
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
-        die("No wallets found in WALLETS_CSV. Provide comma/newline separated pubkeys.")
+        die("No wallets found in WALLETS_CSV.")
 
-    yyyy_mm_dd = today_yyyy_mm_dd_local()
+    # 0) Validate Notion DB schema BEFORE doing anything
+    db = notion_get_database(NOTION_DB_DAILYTOTAL)
+    props = db.get("properties", {})
+    if BASELINE_PROP not in props:
+        available = ", ".join(sorted(props.keys()))
+        die(
+            f"Notion DB does NOT have a property named exactly '{BASELINE_PROP}'.\n"
+            f"Available properties in this DB are:\n{available}\n\n"
+            f"Fix: rename the Notion column to '{BASELINE_PROP}' OR set a GitHub secret BASELINE_PROP to the exact column name."
+        )
 
-    # 1) Find today's page in the existing calendar DB
+    baseline_type = props[BASELINE_PROP].get("type")
+    if baseline_type != "number":
+        die(
+            f"Notion property '{BASELINE_PROP}' exists but is type '{baseline_type}', not 'number'.\n"
+            f"Fix: change '{BASELINE_PROP}' column type to Number in Notion."
+        )
+
+    yyyy_mm_dd = today_yyyy_mm_dd()
+
+    # 1) Find today's page
     today_page = notion_query_today_page(NOTION_DB_DAILYTOTAL, DATE_PROP, yyyy_mm_dd)
 
-    # 2) If page exists and baseline already set -> skip
+    # 2) If exists and already set -> skip
     if today_page:
         page_id = today_page.get("id")
         existing_baseline = notion_get_number_prop(today_page, BASELINE_PROP)
-
         if existing_baseline is not None:
             print(f"Baseline already set for {yyyy_mm_dd}: {existing_baseline}. Skipping.")
             return
 
-        # 3) Compute baseline (TOTAL SOL) and set it ONLY (no other changes)
+        # 3) Compute baseline and set it only
         total_sol = rpc_get_total_sol(wallets)
         total_sol_rounded = round(float(total_sol), 2)
 
@@ -312,11 +261,9 @@ def main():
         print(f"Set SOL Baseline for {yyyy_mm_dd} to {total_sol_rounded} (updated existing page).")
         return
 
-    # 4) No page for today -> create minimal page with baseline
+    # 4) Create minimal page if missing
     total_sol = rpc_get_total_sol(wallets)
     total_sol_rounded = round(float(total_sol), 2)
-
-    # Title format kept simple so it looks like your calendar cards.
     title_text = f"{total_sol_rounded:.2f} SOL"
 
     notion_create_page_daily(
