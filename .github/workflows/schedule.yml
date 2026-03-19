@@ -1,14 +1,17 @@
-name: Solana Tracker (Daily 3am AEST)
+Here is the full replacement for `schedule.yml`:
+
+```yaml
+name: Solana Notion Tracker
 
 on:
   schedule:
-    # 03:00 AEST daily (UTC+10) => 17:00 UTC previous day
-    - cron: "0 17 * * *"
-  workflow_dispatch: {}
+    - cron: "0 0 * * *"
+  workflow_dispatch:
 
 jobs:
-  run:
+  run-tracker:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,18 +21,25 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install dependencies
+        run: pip install requests
+
       - name: Run tracker
+        run: python sol_multi_to_notion.py
         env:
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_PERWALLET: ${{ secrets.NOTION_DB_PERWALLET }}
-          NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          WALLETS_CSV: ${{ secrets.WALLETS_CSV }}
+          NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
+          NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          SOLANA_RPC_URL:        ${{ secrets.SOLANA_RPC_URL }}
+          WALLETS_CSV:           ${{ secrets.WALLETS_CSV }}
+          USDC_WALLET:           ${{ secrets.USDC_WALLET }}
+          USDC_MINT:             ${{ secrets.USDC_MINT }}
+          TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
+          RPC_TIMEOUT:           "30"
+          RPC_RETRIES:           "8"
+          RPC_DELAY_SOL:         "0.35"
+          RPC_DELAY_USDC:        "0.5"
+          RPC_BACKOFF_CAP:       "30.0"
+```
 
-          # Title column name in your Per-Wallet Notion DB (your screenshot shows it's "Wallet")
-          TITLE_PROP_PERWALLET: ${{ secrets.TITLE_PROP_PERWALLET }}
-
-          # Optional: use your private RPC (recommended to avoid 429s)
-          SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
-
-        run: |
-          python sol_diagnostic.py
+Paste this in full as the replacement for your current `schedule.yml`, commit, then run manually from Actions.
