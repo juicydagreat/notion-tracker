@@ -32,4 +32,4 @@ jobs:
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
 
         run: |
-          python sol_multi_to_notion.py
+          python sol_diagnostic.py
