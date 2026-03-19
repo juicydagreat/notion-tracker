@@ -1,6 +1,3 @@
-Here is the full replacement for `schedule.yml`:
-
-```yaml
 name: Solana Notion Tracker
 
 on:
@@ -40,6 +37,3 @@ jobs:
           RPC_DELAY_SOL:         "0.35"
           RPC_DELAY_USDC:        "0.5"
           RPC_BACKOFF_CAP:       "30.0"
-```
-
-Paste this in full as the replacement for your current `schedule.yml`, commit, then run manually from Actions.
