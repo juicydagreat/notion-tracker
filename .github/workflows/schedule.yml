@@ -22,7 +22,7 @@ jobs:
         run: pip install requests
 
       - name: Run tracker
-        run: python sol_multi_to_notion.py
+        run: sol_diagnostic.py
         env:
           NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
