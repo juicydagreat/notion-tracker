@@ -1,5 +1,4 @@
 name: Solana Notion Tracker
-
 on:
   schedule:
     - cron: "0 17 * * *"
@@ -13,19 +12,18 @@ on:
         options:
           - production
           - diagnostic
-
 jobs:
   run-tracker:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
+      - name: Install dependencies
+        run: pip install requests
       - name: Select script
         id: choose
         run: |
@@ -36,7 +34,6 @@ jobs:
           else
             echo "script=sol_multi_to_notion.py" >> $GITHUB_OUTPUT
           fi
-
       - name: Run script
         env:
           NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
