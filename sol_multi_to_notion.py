@@ -38,7 +38,6 @@ RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",      "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",        "10"))
 BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",     "2.0"))
-# Delay between individual calls in fallback mode (be polite to public RPC)
 INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
 
 # Batch RPC endpoints (tried in order)
@@ -84,7 +83,6 @@ _NEXT_URL_CODES = {401, 403}
 
 
 def _http_post(url, payload):
-    """Raw HTTP POST, returns parsed JSON. Raises urllib.error.HTTPError on bad status."""
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -138,7 +136,7 @@ def rpc_call(payload):
 def single_rpc_call(payload):
     """
     Single JSON-RPC call to INDIVIDUAL_RPC with retry.
-    Used by the individual-call fallback path.
+    Used as fallback when batch RPC endpoints are blocked.
     """
     last_err = None
     for attempt in range(RPC_RETRIES):
@@ -161,15 +159,19 @@ def single_rpc_call(payload):
     raise Exception(f"Individual RPC call failed: {last_err}")
 
 
+def rpc_call_with_fallback(payload):
+    """Try batch RPC endpoints first; if all fail, use the individual RPC."""
+    try:
+        return rpc_call(payload)
+    except Exception:
+        return single_rpc_call(payload)
+
+
 def batch_get_sol(wallets):
     """
     Fetch SOL balances for all wallets.
-
-    Fast path: batch JSON-RPC via RPC_URLS (requires endpoint that allows batch).
-    Fallback:  individual getBalance calls on INDIVIDUAL_RPC with INDIVIDUAL_DELAY.
-               Works on the free public mainnet-beta RPC even from GitHub Actions.
+    Fast path: batch JSON-RPC. Fallback: individual calls on INDIVIDUAL_RPC.
     """
-    # —— Try batch ——
     try:
         results = {}
         indexed = list(enumerate(wallets))
@@ -193,7 +195,6 @@ def batch_get_sol(wallets):
         log(f"  Falling back to individual calls on {INDIVIDUAL_RPC}")
         log(f"  ({len(wallets)} wallets x {INDIVIDUAL_DELAY}s delay = ~{len(wallets)*INDIVIDUAL_DELAY:.0f}s)")
 
-    # —— Individual fallback ——
     results = []
     for i, wallet in enumerate(wallets):
         resp = single_rpc_call(
@@ -208,12 +209,18 @@ def batch_get_sol(wallets):
 
 
 def get_usdc_balance(wallet):
-    """Fetch USDC balance for a single wallet (1 HTTP call)."""
-    resp = rpc_call({
+    """Fetch USDC balance for a single wallet. Falls back to individual RPC if batch blocked."""
+    payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
         "params": [wallet, {"mint": USDC_MINT}, {"encoding": "jsonParsed"}],
-    })
+    }
+    try:
+        resp = rpc_call(payload)
+    except Exception:
+        log(f"  Batch RPC blocked for USDC, using individual fallback ({INDIVIDUAL_RPC})")
+        resp = single_rpc_call(payload)
+
     total = 0.0
     for acc in resp.get("result", {}).get("value", []):
         try:
