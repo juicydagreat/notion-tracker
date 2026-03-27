@@ -25,7 +25,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-        # No pip install needed — scripts use only Python stdlib
+        # No pip install needed — pure stdlib
 
       - name: Select script
         id: choose
@@ -45,10 +45,10 @@ jobs:
           USDC_MINT:             ${{ secrets.USDC_MINT }}
           USDC_WALLET:           ${{ secrets.USDC_WALLET }}
           TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
-          # Ankr free public endpoint — no key needed, handles batch well
-          # Your SOLANA_RPC_URL secret (if set) becomes the fallback, not primary
-          SOLANA_RPC_URL:        "https://rpc.ankr.com/solana"
-          SOLANA_RPC_FALLBACK:   ${{ secrets.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com' }}
+          # Free public RPC endpoints — no API key needed
+          # Do NOT set SOLANA_RPC_URL as a secret; delete it if it exists
+          SOLANA_PRIMARY_RPC:    "https://rpc.ankr.com/solana"
+          SOLANA_FALLBACK_RPC:   "https://solana-rpc.publicnode.com"
           # Tuning
           BATCH_SIZE:            "50"
           BATCH_PAUSE:           "1.0"

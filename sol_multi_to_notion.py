@@ -10,9 +10,10 @@ HTTP calls per run:
   1  Notion DB query for previous daily total
   N  Notion page creates (one per wallet + 1 daily total)
 
-RPC fallback: tries SOLANA_RPC_URL first, then SOLANA_RPC_FALLBACK.
-Default primary:  https://rpc.ankr.com/solana  (free, no key needed)
-Default fallback: https://api.mainnet-beta.solana.com
+RPC endpoints (tried in order, first success wins):
+  SOLANA_PRIMARY_RPC   default: https://rpc.ankr.com/solana
+  SOLANA_FALLBACK_RPC  default: https://solana-rpc.publicnode.com
+Both are free public endpoints requiring no API key.
 """
 import os, sys, json, time, random, re
 import urllib.request, urllib.error
@@ -31,13 +32,13 @@ NOTION_VERSION       = "2022-06-28"
 RPC_TIMEOUT     = int(os.environ.get("RPC_TIMEOUT",     "30"))
 RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "5"))
 RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))  # wallets per SOL batch
-BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0")) # seconds between chunks
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))
+BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0"))
 
-# RPC endpoints tried in order; first success wins
-_rpc_primary  = os.environ.get("SOLANA_RPC_URL",      "https://rpc.ankr.com/solana").strip()
-_rpc_fallback = os.environ.get("SOLANA_RPC_FALLBACK", "https://api.mainnet-beta.solana.com").strip()
-RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))  # dedupe, keep order
+# RPC endpoints tried in order — renamed vars to avoid clashing with old secrets
+_rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://rpc.ankr.com/solana").strip()
+_rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://solana-rpc.publicnode.com").strip()
+RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))  # dedupe, preserve order
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -69,9 +70,9 @@ def chunks(lst, n):
 
 
 # ── RPC ────────────────────────────────────────────────────────────────────────────────
-# HTTP codes that mean "retry same URL"
+# HTTP codes that warrant retrying the same URL
 _RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
-# HTTP codes that mean "this URL is broken, try the next one"
+# HTTP codes that mean this URL is broken — skip to next immediately
 _NEXT_URL_CODES = {401, 403}
 
 
@@ -79,9 +80,9 @@ def rpc_call(payload):
     """
     POST a single or batch JSON-RPC payload.
     Tries each URL in RPC_URLS in order:
-      - 429 / transient errors  → retry same URL with backoff
-      - 401 / 403               → skip to next URL immediately (bad key)
-      - success                 → return
+      - 401/403  → bad/missing key, skip to next URL immediately
+      - 429/5xx  → retry same URL with backoff
+      - success  → return
     """
     headers = {"Content-Type": "application/json"}
     last_err = None
