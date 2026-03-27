@@ -4,16 +4,20 @@ Solana → Notion daily balance tracker.
 Zero external dependencies — pure Python stdlib.
 
 HTTP calls per run:
-  1  batch getBalance for all wallets (SOL)
-  1  getTokenAccountsByOwner for the single USDC wallet
-  1  Notion DB query for all previous per-wallet rows
-  1  Notion DB query for previous daily total
-  N  Notion page creates (one per wallet + 1 daily total)
+  1-6 batch getBalance calls (or 54 individual if batch is blocked)
+  1   getTokenAccountsByOwner for the single USDC wallet
+  1   Notion DB query for all previous per-wallet rows
+  1   Notion DB query for previous daily total
+  N   Notion page creates (one per wallet + 1 daily total)
 
-RPC endpoints (tried in order, first success wins):
-  SOLANA_PRIMARY_RPC   default: https://rpc.ankr.com/solana
-  SOLANA_FALLBACK_RPC  default: https://solana-rpc.publicnode.com
-Both are free public endpoints requiring no API key.
+RPC strategy:
+  1. Try batch JSON-RPC (fast — works with a proper API key)
+  2. If ALL batch endpoints return 403/fail, auto-fall back to individual
+     calls on api.mainnet-beta.solana.com with INDIVIDUAL_DELAY between each
+
+To use a free API key (recommended for reliability):
+  Sign up at alchemy.com (free, no credit card), create a Solana app,
+  then set SOLANA_PRIMARY_RPC secret to your Alchemy endpoint URL.
 """
 import os, sys, json, time, random, re
 import urllib.request, urllib.error
@@ -29,16 +33,21 @@ USDC_WALLET          = os.environ.get("USDC_WALLET", "33EUErqH7mog7U2XdtXaZL7S1E
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
 
-RPC_TIMEOUT     = int(os.environ.get("RPC_TIMEOUT",     "30"))
-RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "5"))
-RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))
-BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0"))
+RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",      "30"))
+RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",      "5"))
+RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",        "10"))
+BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",     "2.0"))
+# Delay between individual calls in fallback mode (be polite to public RPC)
+INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
 
-# RPC endpoints tried in order — renamed vars to avoid clashing with old secrets
-_rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://rpc.ankr.com/solana").strip()
-_rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://solana-rpc.publicnode.com").strip()
-RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))  # dedupe, preserve order
+# Batch RPC endpoints (tried in order)
+_rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://solana-rpc.publicnode.com").strip()
+_rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://rpc.ankr.com/solana").strip()
+RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))
+
+# Individual fallback RPC — public mainnet-beta works fine for sequential calls
+INDIVIDUAL_RPC = os.environ.get("INDIVIDUAL_RPC", "https://api.mainnet-beta.solana.com").strip()
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -70,45 +79,43 @@ def chunks(lst, n):
 
 
 # ── RPC ────────────────────────────────────────────────────────────────────────────────
-# HTTP codes that warrant retrying the same URL
-_RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
-# HTTP codes that mean this URL is broken — skip to next immediately
+_RETRY_CODES    = {408, 425, 429, 500, 502, 503, 504}
 _NEXT_URL_CODES = {401, 403}
+
+
+def _http_post(url, payload):
+    """Raw HTTP POST, returns parsed JSON. Raises urllib.error.HTTPError on bad status."""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
+        return json.loads(r.read().decode("utf-8", errors="replace") or "{}")
 
 
 def rpc_call(payload):
     """
-    POST a single or batch JSON-RPC payload.
-    Tries each URL in RPC_URLS in order:
-      - 401/403  → bad/missing key, skip to next URL immediately
-      - 429/5xx  → retry same URL with backoff
-      - success  → return
+    Batch or single JSON-RPC call. Tries each URL in RPC_URLS:
+      - 401/403  → skip to next URL (bad key)
+      - 429/5xx  → retry with backoff
+    Raises if all URLs fail.
     """
-    headers = {"Content-Type": "application/json"}
     last_err = None
-
     for url_idx, url in enumerate(RPC_URLS):
         if url_idx > 0:
             log(f"  [fallback] switching to {url}")
         skip_to_next = False
         for attempt in range(RPC_RETRIES):
             try:
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode(),
-                    headers=headers,
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
-                    data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                data = _http_post(url, payload)
                 if isinstance(data, dict) and data.get("error"):
                     raise Exception(f"RPC error: {data['error']}")
                 return data
             except urllib.error.HTTPError as e:
-                try:
-                    detail = e.read().decode()
-                except Exception:
-                    detail = ""
+                try:    detail = e.read().decode()
+                except: detail = ""
                 last_err = f"HTTP {e.code}: {detail}"
                 if e.code in _NEXT_URL_CODES:
                     log(f"  [{e.code}] bad/missing API key on {url}, trying next endpoint")
@@ -125,40 +132,83 @@ def rpc_call(payload):
                 backoff(attempt)
         if skip_to_next:
             continue
-
     raise Exception(f"All RPC endpoints failed. Last error: {last_err}")
+
+
+def single_rpc_call(payload):
+    """
+    Single JSON-RPC call to INDIVIDUAL_RPC with retry.
+    Used by the individual-call fallback path.
+    """
+    last_err = None
+    for attempt in range(RPC_RETRIES):
+        try:
+            data = _http_post(INDIVIDUAL_RPC, payload)
+            if isinstance(data, dict) and data.get("error"):
+                raise Exception(f"RPC error: {data['error']}")
+            return data
+        except urllib.error.HTTPError as e:
+            try:    detail = e.read().decode()
+            except: detail = ""
+            last_err = f"HTTP {e.code}: {detail}"
+            if e.code in _RETRY_CODES:
+                backoff(attempt)
+            else:
+                raise Exception(last_err)
+        except Exception as ex:
+            last_err = str(ex)
+            backoff(attempt)
+    raise Exception(f"Individual RPC call failed: {last_err}")
 
 
 def batch_get_sol(wallets):
     """
-    Fetch SOL balance for all wallets using batch JSON-RPC.
-    Sends wallets in chunks of BATCH_SIZE — typically 1 HTTP call for 54 wallets.
-    Returns list of floats in the same order as wallets.
+    Fetch SOL balances for all wallets.
+
+    Fast path: batch JSON-RPC via RPC_URLS (requires endpoint that allows batch).
+    Fallback:  individual getBalance calls on INDIVIDUAL_RPC with INDIVIDUAL_DELAY.
+               Works on the free public mainnet-beta RPC even from GitHub Actions.
     """
-    results = {}
-    indexed = list(enumerate(wallets))
-    for i, chunk in enumerate(chunks(indexed, BATCH_SIZE)):
-        if i > 0:
-            time.sleep(BATCH_PAUSE)
-        batch = [
-            {"jsonrpc": "2.0", "id": idx, "method": "getBalance", "params": [w]}
-            for idx, w in chunk
-        ]
-        resp = rpc_call(batch)
-        if not isinstance(resp, list):
-            raise Exception(f"Expected batch list from RPC, got: {type(resp)}")
-        for item in resp:
-            if item.get("error"):
-                raise Exception(f"getBalance error for wallet #{item['id']}: {item['error']}")
-            results[item["id"]] = item["result"]["value"] / 1e9
-    return [results[i] for i in range(len(wallets))]
+    # —— Try batch ——
+    try:
+        results = {}
+        indexed = list(enumerate(wallets))
+        for i, chunk in enumerate(chunks(indexed, BATCH_SIZE)):
+            if i > 0:
+                time.sleep(BATCH_PAUSE)
+            batch = [
+                {"jsonrpc": "2.0", "id": idx, "method": "getBalance", "params": [w]}
+                for idx, w in chunk
+            ]
+            resp = rpc_call(batch)
+            if not isinstance(resp, list):
+                raise Exception(f"Expected list from batch RPC, got: {type(resp)}")
+            for item in resp:
+                if item.get("error"):
+                    raise Exception(f"getBalance error wallet #{item['id']}: {item['error']}")
+                results[item["id"]] = item["result"]["value"] / 1e9
+        return [results[i] for i in range(len(wallets))]
+    except Exception as batch_err:
+        log(f"\n  Batch mode failed: {batch_err}")
+        log(f"  Falling back to individual calls on {INDIVIDUAL_RPC}")
+        log(f"  ({len(wallets)} wallets x {INDIVIDUAL_DELAY}s delay = ~{len(wallets)*INDIVIDUAL_DELAY:.0f}s)")
+
+    # —— Individual fallback ——
+    results = []
+    for i, wallet in enumerate(wallets):
+        resp = single_rpc_call(
+            {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]}
+        )
+        sol = resp["result"]["value"] / 1e9
+        log(f"  [{i+1:02d}/{len(wallets)}] {sol:.4f} SOL  {wallet}")
+        results.append(sol)
+        if i < len(wallets) - 1:
+            time.sleep(INDIVIDUAL_DELAY)
+    return results
 
 
 def get_usdc_balance(wallet):
-    """
-    Fetch USDC balance for a single wallet (1 HTTP call).
-    USDC is only ever held in one wallet so no batch needed.
-    """
+    """Fetch USDC balance for a single wallet (1 HTTP call)."""
     resp = rpc_call({
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
@@ -207,7 +257,6 @@ def notion_req(url, body, method="POST"):
 
 
 def notion_query_paginated(db_id, body):
-    """Fetch all pages of a Notion DB query, handling pagination automatically."""
     rows, cursor = [], None
     while True:
         if cursor:
@@ -221,10 +270,6 @@ def notion_query_paginated(db_id, body):
 
 
 def get_prev_perwallet_rows(today):
-    """
-    Fetch all per-wallet rows before today in a SINGLE Notion query.
-    Returns {wallet_address: most_recent_page} for delta calculations.
-    """
     rows = notion_query_paginated(NOTION_DB_PERWALLET, {
         "filter": {"property": "Date", "date": {"before": today}},
         "sorts":  [{"property": "Date", "direction": "descending"}],
@@ -234,7 +279,7 @@ def get_prev_perwallet_rows(today):
     for page in rows:
         try:
             w = page["properties"][TITLE_PROP]["title"][0]["plain_text"]
-            if w not in lookup:  # first seen = most recent (sorted desc)
+            if w not in lookup:
                 lookup[w] = page
         except (KeyError, IndexError):
             continue
@@ -250,8 +295,7 @@ def get_prev_total_row(today):
             "page_size": 1,
         },
     )
-    results = res.get("results", [])
-    return results[0] if results else None
+    return (res.get("results") or [None])[0]
 
 
 def get_num(page, prop):
@@ -274,7 +318,8 @@ def create_page(db_id, props):
 # ── Main ──────────────────────────────────────────────────────────────────────────────
 def main():
     log("=" * 60)
-    log(f"RPC endpoints: {RPC_URLS}")
+    log(f"Batch RPC endpoints: {RPC_URLS}")
+    log(f"Individual fallback: {INDIVIDUAL_RPC}")
 
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
@@ -286,16 +331,13 @@ def main():
     for i, w in enumerate(wallets, 1):
         log(f"  {i:02d}. {w}")
 
-    # — 1 batch HTTP call for all SOL balances —
-    log(f"\n--- Fetching SOL balances (batch, size={BATCH_SIZE}) ---")
+    log(f"\n--- Fetching SOL balances ---")
     sol_list = batch_get_sol(wallets)
     total_sol = r2(sum(sol_list))
-    for w, s in zip(wallets, sol_list):
-        log(f"  {s:>10.4f} SOL  {w}")
+    log(f"Total SOL: {total_sol}")
 
     time.sleep(BATCH_PAUSE)
 
-    # — 1 single HTTP call for USDC (one wallet only) —
     log(f"\n--- Fetching USDC balance ({USDC_WALLET}) ---")
     usdc_total = r2(get_usdc_balance(USDC_WALLET))
     log(f"  {usdc_total} USDC")
@@ -303,13 +345,11 @@ def main():
 
     log(f"\nSummary: Total SOL={total_sol}  Total USDC={usdc_total}")
 
-    # — 1 Notion query for all previous per-wallet rows —
-    log(f"\n--- Fetching previous Notion rows (single query) ---")
+    log(f"\n--- Fetching previous Notion rows ---")
     prev_lookup = get_prev_perwallet_rows(today)
     prev_total  = get_prev_total_row(today)
     log(f"  {len(prev_lookup)} previous per-wallet rows found")
 
-    # — Write per-wallet rows —
     log(f"\n--- Writing {len(wallets)} per-wallet rows to Notion ---")
     for w, sol, usdc in zip(wallets, sol_list, usdc_list):
         sol  = r2(sol)
@@ -327,7 +367,6 @@ def main():
             "USDC Delta":       {"number": d_usdc},
         })
 
-    # — Write daily total —
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
     p_usdc_t = get_num(prev_total, "USDC End Balance")
