@@ -45,13 +45,15 @@ jobs:
           USDC_MINT:             ${{ secrets.USDC_MINT }}
           USDC_WALLET:           ${{ secrets.USDC_WALLET }}
           TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
-          # Free public RPC endpoints — no API key needed
-          # Do NOT set SOLANA_RPC_URL as a secret; delete it if it exists
-          SOLANA_PRIMARY_RPC:    "https://rpc.ankr.com/solana"
-          SOLANA_FALLBACK_RPC:   "https://solana-rpc.publicnode.com"
-          # Tuning
-          BATCH_SIZE:            "50"
-          BATCH_PAUSE:           "1.0"
+          # Free public RPCs — no API key needed
+          # Primary: PublicNode (Allnodes) — generous free tier, works from CI
+          # Fallback: Ankr public — secondary option
+          SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
+          SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
+          # Smaller batch = less likely to trigger rate limits on free RPCs
+          # 54 wallets / 10 per batch = 6 requests with 2s pauses between each
+          BATCH_SIZE:            "10"
+          BATCH_PAUSE:           "2.0"
           RPC_TIMEOUT:           "30"
           RPC_RETRIES:           "5"
           RPC_BACKOFF_CAP:       "30"
