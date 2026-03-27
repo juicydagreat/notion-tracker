@@ -1,7 +1,8 @@
 name: Solana Notion Tracker
+
 on:
   schedule:
-    - cron: "0 17 * * *"
+    - cron: "0 17 * * *"   # 5 PM UTC daily
   workflow_dispatch:
     inputs:
       mode:
@@ -12,50 +13,42 @@ on:
         options:
           - production
           - diagnostic
+
 jobs:
   run-tracker:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install dependencies
-        run: pip install requests
+        # No pip install needed — scripts use only Python stdlib
+
       - name: Select script
         id: choose
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.mode }}" = "production" ]; then
             echo "script=sol_multi_to_notion.py" >> $GITHUB_OUTPUT
-          elif [ "${{ inputs.mode }}" = "diagnostic" ]; then
-            echo "script=sol_diagnostic.py" >> $GITHUB_OUTPUT
           else
-            echo "script=sol_multi_to_notion.py" >> $GITHUB_OUTPUT
+            echo "script=sol_diagnostic.py" >> $GITHUB_OUTPUT
           fi
+
       - name: Run script
         env:
-          NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
-          NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          WALLETS_CSV:           ${{ secrets.WALLETS_CSV }}
-          SOLANA_RPC_URL:        ${{ secrets.SOLANA_RPC_URL }}
-          USDC_WALLET:           ${{ secrets.USDC_WALLET }}
-          USDC_MINT:             ${{ secrets.USDC_MINT }}
-          TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
-          TOTAL_TITLE_PROP:      "Name"
-          DATE_PROP:             "Date"
-          PROP_SOL_END:          "End Balance"
-          PROP_SOL_DELTA:        "Delta"
-          PROP_USDC_END:         "USDC End Balance"
-          PROP_USDC_DELTA:       "USDC Delta"
-          RPC_TIMEOUT:           "30"
-          RPC_RETRIES:           "8"
-          RPC_DELAY_SOL:         "0.35"
-          RPC_DELAY_USDC:        "0.50"
-          RPC_BACKOFF_CAP:       "30"
-          NOTION_TIMEOUT:        "30"
-          NOTION_RETRIES:        "8"
-          NOTION_BACKOFF_CAP:    "30"
+          NOTION_TOKEN:         ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_PERWALLET:  ${{ secrets.NOTION_DB_PERWALLET }}
+          NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          WALLETS_CSV:          ${{ secrets.WALLETS_CSV }}
+          SOLANA_RPC_URL:       ${{ secrets.SOLANA_RPC_URL }}
+          USDC_MINT:            ${{ secrets.USDC_MINT }}
+          TITLE_PROP_PERWALLET: ${{ secrets.TITLE_PROP_PERWALLET }}
+          # Tuning — adjust if the public RPC still rate-limits
+          BATCH_SIZE:           "50"
+          BATCH_PAUSE:          "1.0"
+          RPC_TIMEOUT:          "30"
+          RPC_RETRIES:          "5"
+          RPC_BACKOFF_CAP:      "30"
         run: python "${{ steps.choose.outputs.script }}"

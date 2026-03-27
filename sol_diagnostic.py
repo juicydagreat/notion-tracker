@@ -1,111 +1,102 @@
-import os
-import sys
-import json
-import time
-import random
-import re
-import urllib.request
-import urllib.error
+#!/usr/bin/env python3
+"""
+Diagnostic script — verify wallet parsing and SOL balances without touching Notion.
+Uses the same batch RPC approach as sol_multi_to_notion.py.
 
-SOLANA_RPC_URL = os.environ.get(
-    "SOLANA_RPC_URL",
-    "https://api.mainnet-beta.solana.com"
-).strip()
+Usage (local):
+  WALLETS_CSV="addr1,addr2,..." python sol_diagnostic.py
 
-WALLETS_CSV = os.environ.get("WALLETS_CSV", "")
+Usage (GitHub Actions):
+  Trigger workflow_dispatch with mode=diagnostic
+"""
+import os, sys, json, time, random, re
+import urllib.request, urllib.error
 
+SOLANA_RPC_URL  = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+WALLETS_CSV     = os.environ.get("WALLETS_CSV", "")
 RPC_TIMEOUT     = int(os.environ.get("RPC_TIMEOUT",     "30"))
-RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "8"))
-RPC_DELAY_SOL   = float(os.environ.get("RPC_DELAY_SOL", "0.35"))
-RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP","30"))
+RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "5"))
+RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30"))
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))
+BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0"))
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
 
-def fail(msg: str) -> None:
-    print(f"ERROR: {msg}", flush=True)
-    sys.exit(1)
+def fail(msg): print(f"ERROR: {msg}", flush=True); sys.exit(1)
+def log(msg):  print(msg, flush=True)
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
-
-
-def parse_wallets(raw: str) -> list[str]:
-    found = PUBKEY_RE.findall(raw or "")
-    out, seen = [], set()
-    for w in found:
+def parse_wallets(raw):
+    seen, out = set(), []
+    for w in PUBKEY_RE.findall(raw or ""):
         if w not in seen:
             seen.add(w)
             out.append(w)
     return out
 
 
-def backoff_sleep(attempt: int) -> None:
-    delay = min((2 ** attempt) + random.uniform(0.0, 0.8), RPC_BACKOFF_CAP)
-    log(f"  Retrying after {delay:.2f}s...")
-    time.sleep(delay)
+def backoff(attempt):
+    d = min(2 ** attempt + random.uniform(0, 0.8), RPC_BACKOFF_CAP)
+    log(f"  Retrying in {d:.1f}s...")
+    time.sleep(d)
 
 
-def rpc_post(payload: dict) -> dict:
+def chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def rpc_call(payload):
+    headers = {"Content-Type": "application/json"}
     last_err = None
-
     for attempt in range(RPC_RETRIES):
         try:
             req = urllib.request.Request(
                 SOLANA_RPC_URL,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload).encode(),
+                headers=headers,
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-                parsed = json.loads(raw) if raw else {}
-
-            if isinstance(parsed, dict) and parsed.get("error") is not None:
-                raise Exception(f"RPC error: {parsed['error']}")
-
-            return parsed
-
+            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+            if isinstance(data, dict) and data.get("error"):
+                raise Exception(f"RPC error: {data['error']}")
+            return data
         except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            last_err = f"HTTP {e.code} {e.reason}: {detail}"
-
+            try:    detail = e.read().decode()
+            except: detail = ""
+            last_err = f"HTTP {e.code}: {detail}"
             if e.code == 429:
-                log(f"  Rate limit: {last_err}")
+                log(f"  [429] rate limited")
                 if "max usage reached" in detail:
                     raise Exception(f"RPC quota exhausted: {last_err}")
-                backoff_sleep(attempt + 1)
-                continue
-
-            if e.code in (408, 425, 500, 502, 503, 504):
-                log(f"  Transient RPC error: {last_err}")
-                backoff_sleep(attempt + 1)
-                continue
-
-            raise Exception(last_err)
-
-        except Exception as e:
-            last_err = str(e)
-            log(f"  RPC request error: {last_err}")
-            backoff_sleep(attempt + 1)
-
-    raise Exception(f"RPC failed after {RPC_RETRIES} retries. Last: {last_err}")
+            elif e.code not in (408, 425, 500, 502, 503, 504):
+                raise Exception(last_err)
+            backoff(attempt)
+        except Exception as ex:
+            last_err = str(ex); log(f"  [rpc] {last_err}"); backoff(attempt)
+    raise Exception(f"RPC failed after {RPC_RETRIES} attempts: {last_err}")
 
 
-def rpc_get_sol_balance(wallet: str) -> float:
-    res = rpc_post({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getBalance",
-        "params": [wallet],
-    })
-    if "result" not in res or "value" not in res["result"]:
-        raise Exception(f"RPC missing result for getBalance({wallet}): {res}")
-    return res["result"]["value"] / 1e9
+def batch_get_sol(wallets):
+    results = {}
+    indexed = list(enumerate(wallets))
+    for i, chunk in enumerate(chunks(indexed, BATCH_SIZE)):
+        if i > 0:
+            time.sleep(BATCH_PAUSE)
+        batch = [
+            {"jsonrpc": "2.0", "id": idx, "method": "getBalance", "params": [w]}
+            for idx, w in chunk
+        ]
+        resp = rpc_call(batch)
+        if not isinstance(resp, list):
+            raise Exception(f"Expected list from batch RPC, got: {type(resp)}")
+        for item in resp:
+            if item.get("error"):
+                raise Exception(f"getBalance error for wallet #{item['id']}: {item['error']}")
+            results[item["id"]] = item["result"]["value"] / 1e9
+    return [results[i] for i in range(len(wallets))]
 
 
 def main():
@@ -114,46 +105,39 @@ def main():
 
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
-        fail("No valid Solana pubkeys found in WALLETS_CSV.")
+        fail("No valid Solana pubkeys found in WALLETS_CSV")
 
     print("=" * 60)
-    print(f"PARSED WALLET COUNT: {len(wallets)}")
+    print(f"RPC:           {SOLANA_RPC_URL}")
+    print(f"Wallet count:  {len(wallets)}")
+    print(f"Batch size:    {BATCH_SIZE}")
     print("=" * 60)
     for i, w in enumerate(wallets, 1):
-        print(f"{i:5d}. {w}")
+        print(f"  {i:3d}. {w}")
     print()
 
-    rows = []
-    zero_wallets = []
-    total_sol = 0.0
+    print("Fetching SOL balances (batch)...")
+    sol_list = batch_get_sol(wallets)
 
-    for i, w in enumerate(wallets, 1):
-        print(f"Fetching [{i:3d}/{len(wallets)}]: {w}")
-        sol = rpc_get_sol_balance(w)
-        print(f"  -> {sol:.9f} SOL")
-        rows.append((w, sol))
-        total_sol += sol
-        if sol == 0:
-            zero_wallets.append(w)
-        time.sleep(RPC_DELAY_SOL)
-
-    rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)
+    rows = sorted(zip(wallets, sol_list), key=lambda x: x[1], reverse=True)
+    zero = [w for w, s in rows if s == 0]
+    total = sum(s for _, s in rows)
 
     print()
     print("=" * 60)
-    print("SORTED BALANCES (descending)")
+    print("SORTED BALANCES")
     print("=" * 60)
-    for i, (w, sol) in enumerate(rows_sorted, 1):
-        print(f"{i:5d}. {w}   {sol:16.9f} SOL")
+    for i, (w, s) in enumerate(rows, 1):
+        print(f"  {i:3d}. {s:>14.9f} SOL  {w}")
 
     print()
     print("=" * 60)
-    print(f"TOTAL SOL:         {total_sol:.9f}")
-    print(f"WALLET COUNT:      {len(wallets)}")
-    print(f"ZERO-BALANCE:      {len(zero_wallets)}")
-    if zero_wallets:
-        print("  Zero-balance wallets (check if intentional or fetch error):")
-        for w in zero_wallets:
+    print(f"Total SOL:    {total:.9f}")
+    print(f"Wallets:      {len(wallets)}")
+    print(f"Zero-balance: {len(zero)}")
+    if zero:
+        print("  Zero-balance wallets:")
+        for w in zero:
             print(f"    {w}")
     print("=" * 60)
 
