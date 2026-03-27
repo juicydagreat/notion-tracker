@@ -69,10 +69,19 @@ def chunks(lst, n):
 
 
 # ── RPC ────────────────────────────────────────────────────────────────────────────────
+# HTTP codes that mean "retry same URL"
+_RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+# HTTP codes that mean "this URL is broken, try the next one"
+_NEXT_URL_CODES = {401, 403}
+
+
 def rpc_call(payload):
     """
     POST a single or batch JSON-RPC payload.
-    Tries each URL in RPC_URLS in order; moves to the next on persistent 429s.
+    Tries each URL in RPC_URLS in order:
+      - 429 / transient errors  → retry same URL with backoff
+      - 401 / 403               → skip to next URL immediately (bad key)
+      - success                 → return
     """
     headers = {"Content-Type": "application/json"}
     last_err = None
@@ -80,6 +89,7 @@ def rpc_call(payload):
     for url_idx, url in enumerate(RPC_URLS):
         if url_idx > 0:
             log(f"  [fallback] switching to {url}")
+        skip_to_next = False
         for attempt in range(RPC_RETRIES):
             try:
                 req = urllib.request.Request(
@@ -99,12 +109,12 @@ def rpc_call(payload):
                 except Exception:
                     detail = ""
                 last_err = f"HTTP {e.code}: {detail}"
-                if e.code == 429:
-                    log(f"  [429] rate limited on {url}")
-                    if attempt < RPC_RETRIES - 1:
-                        backoff(attempt)
-                    # after last retry on this URL, break to next URL
-                elif e.code in (408, 425, 500, 502, 503, 504):
+                if e.code in _NEXT_URL_CODES:
+                    log(f"  [{e.code}] bad/missing API key on {url}, trying next endpoint")
+                    skip_to_next = True
+                    break
+                elif e.code in _RETRY_CODES:
+                    log(f"  [{e.code}] retrying {url}")
                     backoff(attempt)
                 else:
                     raise Exception(last_err)
@@ -112,6 +122,8 @@ def rpc_call(payload):
                 last_err = str(ex)
                 log(f"  [rpc] {last_err}")
                 backoff(attempt)
+        if skip_to_next:
+            continue
 
     raise Exception(f"All RPC endpoints failed. Last error: {last_err}")
 
