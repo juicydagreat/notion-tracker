@@ -3,12 +3,12 @@
 Solana → Notion daily balance tracker.
 Zero external dependencies — pure Python stdlib.
 
-Key optimizations vs previous version:
-  - Batch RPC: all getBalance + getTokenAccountsByOwner in 2 HTTP requests
-    instead of 80+. Eliminates rate-limit issues on the public RPC.
-  - Single Notion query for all previous rows instead of one per wallet.
-  - USDC checked on every wallet, not just one hardcoded address.
-  - No external packages — pip install not required.
+HTTP calls per run:
+  1  batch getBalance for all wallets (SOL)
+  1  getTokenAccountsByOwner for the single USDC wallet
+  1  Notion DB query for all previous per-wallet rows
+  1  Notion DB query for previous daily total
+  N  Notion page creates (one per wallet + 1 daily total)
 
 Free RPC options (set SOLANA_RPC_URL secret):
   https://api.mainnet-beta.solana.com   (official public, default)
@@ -24,17 +24,16 @@ NOTION_DB_PERWALLET  = os.environ["NOTION_DB_PERWALLET"].strip()
 NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"].strip()
 WALLETS_CSV          = os.environ["WALLETS_CSV"]
 SOLANA_RPC_URL       = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
-USDC_MINT            = os.environ.get("USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
+USDC_MINT            = os.environ.get("USDC_MINT",   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
+USDC_WALLET          = os.environ.get("USDC_WALLET", "33EUErqH7mog7U2XdtXaZL7S1EEpJw1TEv7dswm76SzM").strip()
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
 
 RPC_TIMEOUT     = int(os.environ.get("RPC_TIMEOUT",     "30"))
 RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "5"))
 RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
-# How many wallets per RPC batch call (lower if public RPC still rate-limits)
-BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",      "50"))
-# Seconds to pause between batch chunks
-BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",   "1.0"))
+BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))  # wallets per SOL batch
+BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0")) # seconds between chunks
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -105,9 +104,8 @@ def rpc_call(payload):
 
 def batch_get_sol(wallets):
     """
-    Fetch SOL balance for every wallet using batch JSON-RPC.
-    All wallets are sent in chunks of BATCH_SIZE — typically 1–2 HTTP calls
-    instead of one call per wallet.
+    Fetch SOL balance for all wallets using batch JSON-RPC.
+    Sends wallets in chunks of BATCH_SIZE — typically 1 HTTP call for 40 wallets.
     Returns list of floats in the same order as wallets.
     """
     results = {}
@@ -129,45 +127,30 @@ def batch_get_sol(wallets):
     return [results[i] for i in range(len(wallets))]
 
 
-def batch_get_usdc(wallets):
+def get_usdc_balance(wallet):
     """
-    Fetch USDC balance for every wallet using batch JSON-RPC.
-    Returns list of floats in the same order as wallets.
+    Fetch USDC balance for a single wallet (1 HTTP call).
+    USDC is only ever held in one wallet so no batch needed.
     """
-    results = {}
-    indexed = list(enumerate(wallets))
-    for i, chunk in enumerate(chunks(indexed, BATCH_SIZE)):
-        if i > 0:
-            time.sleep(BATCH_PAUSE)
-        batch = [
-            {
-                "jsonrpc": "2.0", "id": idx,
-                "method": "getTokenAccountsByOwner",
-                "params": [w, {"mint": USDC_MINT}, {"encoding": "jsonParsed"}],
-            }
-            for idx, w in chunk
-        ]
-        resp = rpc_call(batch)
-        if not isinstance(resp, list):
-            raise Exception(f"Expected batch list from RPC, got: {type(resp)}")
-        for item in resp:
-            if item.get("error"):
-                raise Exception(f"getTokenAccountsByOwner error for wallet #{item['id']}: {item['error']}")
-            total = 0.0
-            for acc in item["result"]["value"]:
-                try:
-                    ta = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]
-                    ui = ta.get("uiAmount")
-                    if ui is not None:
-                        total += float(ui)
-                    else:
-                        amt = int(ta.get("amount", 0))
-                        dec = int(ta.get("decimals", 0))
-                        total += amt / 10 ** dec if dec else float(amt)
-                except Exception:
-                    continue
-            results[item["id"]] = total
-    return [results[i] for i in range(len(wallets))]
+    resp = rpc_call({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [wallet, {"mint": USDC_MINT}, {"encoding": "jsonParsed"}],
+    })
+    total = 0.0
+    for acc in resp.get("result", {}).get("value", []):
+        try:
+            ta = acc["account"]["data"]["parsed"]["info"]["tokenAmount"]
+            ui = ta.get("uiAmount")
+            if ui is not None:
+                total += float(ui)
+            else:
+                amt = int(ta.get("amount", 0))
+                dec = int(ta.get("decimals", 0))
+                total += amt / 10 ** dec if dec else float(amt)
+        except Exception:
+            continue
+    return total
 
 
 # ── Notion ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +197,6 @@ def get_prev_perwallet_rows(today):
     """
     Fetch all per-wallet rows before today in a SINGLE Notion query.
     Returns {wallet_address: most_recent_page} for delta calculations.
-    Previously this was one query per wallet (40+ queries).
     """
     rows = notion_query_paginated(NOTION_DB_PERWALLET, {
         "filter": {"property": "Date", "date": {"before": today}},
@@ -275,10 +257,11 @@ def main():
 
     log("=" * 60)
     log(f"Date: {today}  |  Wallets: {len(wallets)}")
+    log(f"USDC wallet: {USDC_WALLET}")
     for i, w in enumerate(wallets, 1):
         log(f"  {i:02d}. {w}")
 
-    # — Fetch all SOL balances: 1 HTTP call (or 2 if >BATCH_SIZE wallets) —
+    # — 1 batch HTTP call for all SOL balances —
     log(f"\n--- Fetching SOL balances (batch, size={BATCH_SIZE}) ---")
     sol_list = batch_get_sol(wallets)
     total_sol = r2(sum(sol_list))
@@ -287,17 +270,16 @@ def main():
 
     time.sleep(BATCH_PAUSE)
 
-    # — Fetch all USDC balances: 1 HTTP call (or 2 if >BATCH_SIZE wallets) —
-    log(f"\n--- Fetching USDC balances (batch, size={BATCH_SIZE}) ---")
-    usdc_list = batch_get_usdc(wallets)
-    total_usdc = r2(sum(usdc_list))
-    for w, u in zip(wallets, usdc_list):
-        if u > 0:
-            log(f"  {u:>10.2f} USDC  {w}")
+    # — 1 single HTTP call for USDC (one wallet only) —
+    log(f"\n--- Fetching USDC balance ({USDC_WALLET}) ---")
+    usdc_total = r2(get_usdc_balance(USDC_WALLET))
+    log(f"  {usdc_total} USDC")
+    # Map USDC to the right wallet; all others get 0
+    usdc_list = [usdc_total if w == USDC_WALLET else 0.0 for w in wallets]
 
-    log(f"\nSummary: Total SOL={total_sol}  Total USDC={total_usdc}")
+    log(f"\nSummary: Total SOL={total_sol}  Total USDC={usdc_total}")
 
-    # — Fetch all previous Notion rows: 1 query instead of 40 —
+    # — 1 Notion query for all previous per-wallet rows —
     log(f"\n--- Fetching previous Notion rows (single query) ---")
     prev_lookup = get_prev_perwallet_rows(today)
     prev_total  = get_prev_total_row(today)
@@ -325,15 +307,15 @@ def main():
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
     p_usdc_t = get_num(prev_total, "USDC End Balance")
-    d_sol_t  = r2(total_sol  - p_sol_t)  if prev_total else None
-    d_usdc_t = r2(total_usdc - p_usdc_t) if prev_total else None
-    log(f"  SOL={total_sol} \u0394{d_sol_t}  USDC={total_usdc} \u0394{d_usdc_t}")
+    d_sol_t  = r2(total_sol   - p_sol_t)  if prev_total else None
+    d_usdc_t = r2(usdc_total  - p_usdc_t) if prev_total else None
+    log(f"  SOL={total_sol} \u0394{d_sol_t}  USDC={usdc_total} \u0394{d_usdc_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
         "Name":             {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},
         "Date":             {"date":  {"start": today}},
         "End Balance":      {"number": total_sol},
         "Delta":            {"number": d_sol_t},
-        "USDC End Balance": {"number": total_usdc},
+        "USDC End Balance": {"number": usdc_total},
         "USDC Delta":       {"number": d_usdc_t},
     })
     log("\nDone.")

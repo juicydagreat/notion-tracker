@@ -44,8 +44,9 @@ jobs:
           WALLETS_CSV:          ${{ secrets.WALLETS_CSV }}
           SOLANA_RPC_URL:       ${{ secrets.SOLANA_RPC_URL }}
           USDC_MINT:            ${{ secrets.USDC_MINT }}
+          USDC_WALLET:          ${{ secrets.USDC_WALLET }}
           TITLE_PROP_PERWALLET: ${{ secrets.TITLE_PROP_PERWALLET }}
-          # Tuning — adjust if the public RPC still rate-limits
+          # Tuning — lower BATCH_SIZE (e.g. 20) if public RPC still rate-limits
           BATCH_SIZE:           "50"
           BATCH_PAUSE:          "1.0"
           RPC_TIMEOUT:          "30"
