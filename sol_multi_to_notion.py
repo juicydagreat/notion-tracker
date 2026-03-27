@@ -10,9 +10,9 @@ HTTP calls per run:
   1  Notion DB query for previous daily total
   N  Notion page creates (one per wallet + 1 daily total)
 
-Free RPC options (set SOLANA_RPC_URL secret):
-  https://api.mainnet-beta.solana.com   (official public, default)
-  https://rpc.ankr.com/solana           (Ankr public, more permissive)
+RPC fallback: tries SOLANA_RPC_URL first, then SOLANA_RPC_FALLBACK.
+Default primary:  https://rpc.ankr.com/solana  (free, no key needed)
+Default fallback: https://api.mainnet-beta.solana.com
 """
 import os, sys, json, time, random, re
 import urllib.request, urllib.error
@@ -23,7 +23,6 @@ NOTION_TOKEN         = os.environ["NOTION_TOKEN"].strip()
 NOTION_DB_PERWALLET  = os.environ["NOTION_DB_PERWALLET"].strip()
 NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"].strip()
 WALLETS_CSV          = os.environ["WALLETS_CSV"]
-SOLANA_RPC_URL       = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
 USDC_MINT            = os.environ.get("USDC_MINT",   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
 USDC_WALLET          = os.environ.get("USDC_WALLET", "33EUErqH7mog7U2XdtXaZL7S1EEpJw1TEv7dswm76SzM").strip()
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
@@ -34,6 +33,11 @@ RPC_RETRIES     = int(os.environ.get("RPC_RETRIES",     "5"))
 RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
 BATCH_SIZE      = int(os.environ.get("BATCH_SIZE",       "50"))  # wallets per SOL batch
 BATCH_PAUSE     = float(os.environ.get("BATCH_PAUSE",    "1.0")) # seconds between chunks
+
+# RPC endpoints tried in order; first success wins
+_rpc_primary  = os.environ.get("SOLANA_RPC_URL",      "https://rpc.ankr.com/solana").strip()
+_rpc_fallback = os.environ.get("SOLANA_RPC_FALLBACK", "https://api.mainnet-beta.solana.com").strip()
+RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))  # dedupe, keep order
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -66,46 +70,56 @@ def chunks(lst, n):
 
 # ── RPC ────────────────────────────────────────────────────────────────────────────────
 def rpc_call(payload):
-    """POST a single or batch JSON-RPC payload; retry with exponential backoff."""
+    """
+    POST a single or batch JSON-RPC payload.
+    Tries each URL in RPC_URLS in order; moves to the next on persistent 429s.
+    """
     headers = {"Content-Type": "application/json"}
     last_err = None
-    for attempt in range(RPC_RETRIES):
-        try:
-            req = urllib.request.Request(
-                SOLANA_RPC_URL,
-                data=json.dumps(payload).encode(),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
-                data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-            if isinstance(data, dict) and data.get("error"):
-                raise Exception(f"RPC error: {data['error']}")
-            return data
-        except urllib.error.HTTPError as e:
+
+    for url_idx, url in enumerate(RPC_URLS):
+        if url_idx > 0:
+            log(f"  [fallback] switching to {url}")
+        for attempt in range(RPC_RETRIES):
             try:
-                detail = e.read().decode()
-            except Exception:
-                detail = ""
-            last_err = f"HTTP {e.code}: {detail}"
-            if e.code == 429:
-                log(f"  [429] rate limited")
-                if "max usage reached" in detail:
-                    raise Exception(f"RPC quota exhausted: {last_err}")
-            elif e.code not in (408, 425, 500, 502, 503, 504):
-                raise Exception(last_err)
-            backoff(attempt)
-        except Exception as ex:
-            last_err = str(ex)
-            log(f"  [rpc] {last_err}")
-            backoff(attempt)
-    raise Exception(f"RPC failed after {RPC_RETRIES} attempts: {last_err}")
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode(),
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=RPC_TIMEOUT) as r:
+                    data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                if isinstance(data, dict) and data.get("error"):
+                    raise Exception(f"RPC error: {data['error']}")
+                return data
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = e.read().decode()
+                except Exception:
+                    detail = ""
+                last_err = f"HTTP {e.code}: {detail}"
+                if e.code == 429:
+                    log(f"  [429] rate limited on {url}")
+                    if attempt < RPC_RETRIES - 1:
+                        backoff(attempt)
+                    # after last retry on this URL, break to next URL
+                elif e.code in (408, 425, 500, 502, 503, 504):
+                    backoff(attempt)
+                else:
+                    raise Exception(last_err)
+            except Exception as ex:
+                last_err = str(ex)
+                log(f"  [rpc] {last_err}")
+                backoff(attempt)
+
+    raise Exception(f"All RPC endpoints failed. Last error: {last_err}")
 
 
 def batch_get_sol(wallets):
     """
     Fetch SOL balance for all wallets using batch JSON-RPC.
-    Sends wallets in chunks of BATCH_SIZE — typically 1 HTTP call for 40 wallets.
+    Sends wallets in chunks of BATCH_SIZE — typically 1 HTTP call for 54 wallets.
     Returns list of floats in the same order as wallets.
     """
     results = {}
@@ -246,16 +260,14 @@ def create_page(db_id, props):
 
 # ── Main ──────────────────────────────────────────────────────────────────────────────
 def main():
-    if not SOLANA_RPC_URL.startswith("https://"):
-        fail(f"SOLANA_RPC_URL must start with https:// (got: {SOLANA_RPC_URL})")
+    log("=" * 60)
+    log(f"RPC endpoints: {RPC_URLS}")
 
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
         fail("No valid Solana pubkeys found in WALLETS_CSV")
 
     today = datetime.now(timezone.utc).date().isoformat()
-
-    log("=" * 60)
     log(f"Date: {today}  |  Wallets: {len(wallets)}")
     log(f"USDC wallet: {USDC_WALLET}")
     for i, w in enumerate(wallets, 1):
@@ -274,7 +286,6 @@ def main():
     log(f"\n--- Fetching USDC balance ({USDC_WALLET}) ---")
     usdc_total = r2(get_usdc_balance(USDC_WALLET))
     log(f"  {usdc_total} USDC")
-    # Map USDC to the right wallet; all others get 0
     usdc_list = [usdc_total if w == USDC_WALLET else 0.0 for w in wallets]
 
     log(f"\nSummary: Total SOL={total_sol}  Total USDC={usdc_total}")
@@ -307,8 +318,8 @@ def main():
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
     p_usdc_t = get_num(prev_total, "USDC End Balance")
-    d_sol_t  = r2(total_sol   - p_sol_t)  if prev_total else None
-    d_usdc_t = r2(usdc_total  - p_usdc_t) if prev_total else None
+    d_sol_t  = r2(total_sol  - p_sol_t)  if prev_total else None
+    d_usdc_t = r2(usdc_total - p_usdc_t) if prev_total else None
     log(f"  SOL={total_sol} \u0394{d_sol_t}  USDC={usdc_total} \u0394{d_usdc_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
         "Name":             {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},

@@ -38,18 +38,22 @@ jobs:
 
       - name: Run script
         env:
-          NOTION_TOKEN:         ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_PERWALLET:  ${{ secrets.NOTION_DB_PERWALLET }}
-          NOTION_DB_DAILYTOTAL: ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          WALLETS_CSV:          ${{ secrets.WALLETS_CSV }}
-          SOLANA_RPC_URL:       ${{ secrets.SOLANA_RPC_URL }}
-          USDC_MINT:            ${{ secrets.USDC_MINT }}
-          USDC_WALLET:          ${{ secrets.USDC_WALLET }}
-          TITLE_PROP_PERWALLET: ${{ secrets.TITLE_PROP_PERWALLET }}
-          # Tuning — lower BATCH_SIZE (e.g. 20) if public RPC still rate-limits
-          BATCH_SIZE:           "50"
-          BATCH_PAUSE:          "1.0"
-          RPC_TIMEOUT:          "30"
-          RPC_RETRIES:          "5"
-          RPC_BACKOFF_CAP:      "30"
+          NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
+          NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          WALLETS_CSV:           ${{ secrets.WALLETS_CSV }}
+          USDC_MINT:             ${{ secrets.USDC_MINT }}
+          USDC_WALLET:           ${{ secrets.USDC_WALLET }}
+          TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
+          # Primary RPC — Ankr free public endpoint (no key needed, handles batch well)
+          # Override by setting SOLANA_RPC_URL secret if you have a dedicated endpoint
+          SOLANA_RPC_URL:        ${{ secrets.SOLANA_RPC_URL || 'https://rpc.ankr.com/solana' }}
+          # Fallback RPC tried automatically if primary returns 429
+          SOLANA_RPC_FALLBACK:   ${{ secrets.SOLANA_RPC_FALLBACK || 'https://api.mainnet-beta.solana.com' }}
+          # Tuning — lower BATCH_SIZE (e.g. 20) if RPC still rate-limits
+          BATCH_SIZE:            "50"
+          BATCH_PAUSE:           "1.0"
+          RPC_TIMEOUT:           "30"
+          RPC_RETRIES:           "5"
+          RPC_BACKOFF_CAP:       "30"
         run: python "${{ steps.choose.outputs.script }}"
