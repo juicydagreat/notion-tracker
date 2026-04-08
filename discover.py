@@ -3,12 +3,13 @@
 Solana Wallet Discovery Tool
 ────────────────────────────
 Commands:
-  clusters          Show known clusters from your wallet list (no API)
-  scan-block <sig>  Scan block for same-fee matches to a known tx
-  scan-cluster <name>  Co-occurrence scan for a named cluster
-  trace <address>   Trace funding chain for an address
-  candidates        Show saved match candidates from DB
-  refresh <name>    Re-fetch transaction data for a named cluster
+  clusters               Show known clusters from your wallet list (no API)
+  scan-block <sig>       Scan block for same-fee matches to a known tx
+  scan-cluster <name>    Co-occurrence scan for a named cluster
+  trace <address>        Trace funding chain for an address
+  candidates             Show saved match candidates from DB
+  refresh <name>         Re-fetch transaction data for a named cluster
+  export <name> [addrs]  Export cluster as importable JSON with UPPER/lower naming
 """
 import asyncio
 import json
@@ -32,6 +33,10 @@ from src.matcher import (
     fetch_and_cache_wallet_sigs,
     funding_trace,
 )
+from src.output import export_cluster, write_export, merge_into_wallets_json
+from src.twitter import search_url as twitter_search_url
+from src.gmgn import wallet_page_url as gmgn_page_url
+from src.kolscan import wallet_page_url as kolscan_page_url
 
 console = Console()
 
@@ -225,6 +230,127 @@ async def cmd_refresh(name: str, registry: WalletRegistry):
         await client.close()
 
 
+async def cmd_export(
+    cluster_name: str,
+    registry: WalletRegistry,
+    extra_addresses: list[str],
+    no_twitter: bool = False,
+    output_file: str = "",
+    merge: bool = False,
+):
+    """
+    Export a cluster as importable JSON with UPPERCASE main / lowercase alts.
+
+    Discovery pipeline:
+      1. KolScan leaderboard  → main wallet
+      2. GMGN realized PnL   → main wallet (fallback)
+      3. Twitter/X search    → identity hints
+    """
+    wallets = registry.by_name(cluster_name)
+    if not wallets and not extra_addresses:
+        console.print(f"[red]No wallets found for cluster:[/red] {cluster_name}")
+        similar = registry.search(cluster_name)
+        if similar:
+            console.print("Did you mean:")
+            for w in similar[:5]:
+                console.print(f"  {w.display}")
+        return
+
+    n_known = len(wallets)
+    n_new = len(extra_addresses)
+    console.print(
+        f"\n[cyan]Exporting cluster:[/cyan] '{cluster_name}' "
+        f"({n_known} tracked + {n_new} new)"
+    )
+
+    with console.status("[dim]Checking KolScan & GMGN…[/dim]"):
+        result, entries = await export_cluster(
+            cluster_name,
+            registry,
+            new_addresses=extra_addresses if extra_addresses else None,
+            run_twitter=not no_twitter,
+        )
+
+    # ── Summary panel ────────────────────────────────────────────────────────
+    main_addr = result.main_address or "unknown"
+    main_w = registry.get(main_addr)
+    pnl_str = ""
+    if main_addr in result.pnl and result.pnl[main_addr] is not None:
+        pnl_str = f"  [dim]PnL: ${result.pnl[main_addr]:,.0f}[/dim]"
+
+    console.print(Panel(
+        f"[bold green]Main wallet (UPPERCASE):[/bold green] {main_addr}\n"
+        f"[dim]Source: {result.main_source}{pnl_str}[/dim]\n"
+        f"[bold]Alt wallets:[/bold] {len(result.alt_addresses)}\n"
+        f"[bold]New (discovered):[/bold] {len(result.new_addresses)}",
+        title=f"Cluster: {cluster_name.upper()}",
+        border_style="green",
+    ))
+
+    # ── Wallet table ─────────────────────────────────────────────────────────
+    t = Table(title="Export Preview", box=box.SIMPLE)
+    t.add_column("Address", style="cyan")
+    t.add_column("Name", style="bold")
+    t.add_column("Role")
+    t.add_column("KolScan")
+    t.add_column("GMGN PnL", justify="right")
+    t.add_column("Twitter")
+
+    all_addrs = result.all_addresses
+    for entry in entries:
+        addr = entry["trackedWalletAddress"]
+        name = entry["name"]
+        is_main = addr == result.main_address
+        role = "[green]MAIN[/green]" if is_main else "[dim]alt[/dim]"
+        if addr in result.new_addresses:
+            role = "[yellow]NEW[/yellow]"
+
+        ks_url = kolscan_page_url(addr)
+        gm_url = gmgn_page_url(addr)
+        pnl = result.pnl.get(addr)
+        pnl_disp = f"${pnl:,.0f}" if pnl is not None else "[dim]—[/dim]"
+
+        tw = result.twitter_hits.get(addr)
+        tw_disp = (
+            f"[link={tw.query_url}]{tw.suggested_name or str(tw.mentions) + ' hits'}[/link]"
+            if tw else "[dim]—[/dim]"
+        )
+
+        t.add_row(addr[:16] + "…", name, role, f"[link={ks_url}]view[/link]", pnl_disp, tw_disp)
+
+    console.print(t)
+
+    # ── Write output ─────────────────────────────────────────────────────────
+    if merge:
+        updated, added = merge_into_wallets_json(entries)
+        console.print(
+            f"\n[green]✓ Merged into wallets.json[/green] — "
+            f"{updated} updated, {added} added"
+        )
+    elif output_file:
+        write_export(entries, output_file)
+        console.print(f"\n[green]✓ Saved[/green] → {output_file}")
+        console.print(f"[dim]Import this file into your terminal tracker.[/dim]")
+    else:
+        # Print JSON to stdout so user can pipe / copy
+        console.print("\n[bold]Import JSON:[/bold]")
+        console.print_json(json.dumps(entries, indent=2))
+
+    # ── Manual verification links ────────────────────────────────────────────
+    console.print("\n[dim]Manual verification:[/dim]")
+    for addr in all_addrs[:5]:
+        tw = result.twitter_hits.get(addr)
+        tw_url = tw.query_url if tw else twitter_search_url(addr)
+        console.print(
+            f"  [cyan]{addr[:12]}…[/cyan]  "
+            f"[link={kolscan_page_url(addr)}]KolScan[/link]  "
+            f"[link={gmgn_page_url(addr)}]GMGN[/link]  "
+            f"[link={tw_url}]Twitter[/link]"
+        )
+    if len(all_addrs) > 5:
+        console.print(f"  … and {len(all_addrs) - 5} more")
+
+
 def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
     """Show all saved match candidates from DB."""
     candidates = get_candidates(min_confidence=min_conf)
@@ -311,6 +437,44 @@ async def main():
         init_db()
         min_conf = float(args[1]) if len(args) > 1 else 0.5
         cmd_candidates(registry, min_conf)
+
+    elif cmd == "export":
+        if len(args) < 2:
+            console.print(
+                "[red]Usage:[/red] python discover.py export <name> [addr1 addr2 …] "
+                "[--no-twitter] [--out file.json] [--merge]"
+            )
+            return
+        check_setup()
+        registry = WalletRegistry()
+
+        cluster_name = args[1]
+        extra_addrs = []
+        no_twitter = False
+        out_file = ""
+        merge = False
+        i = 2
+        while i < len(args):
+            a = args[i]
+            if a == "--no-twitter":
+                no_twitter = True
+            elif a == "--merge":
+                merge = True
+            elif a == "--out" and i + 1 < len(args):
+                out_file = args[i + 1]
+                i += 1
+            elif not a.startswith("--"):
+                extra_addrs.append(a)
+            i += 1
+
+        await cmd_export(
+            cluster_name,
+            registry,
+            extra_addresses=extra_addrs,
+            no_twitter=no_twitter,
+            output_file=out_file,
+            merge=merge,
+        )
 
     else:
         console.print(f"[red]Unknown command:[/red] {cmd}")

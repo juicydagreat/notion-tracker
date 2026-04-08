@@ -52,6 +52,31 @@ python discover.py candidates
 python discover.py candidates 0.7  # min 70% confidence
 ```
 
+### Export a cluster as importable JSON
+```bash
+# Export known cluster — prints JSON to stdout
+python discover.py export brad
+
+# Include newly discovered addresses in the export
+python discover.py export brad <addr1> <addr2>
+
+# Save directly to a file
+python discover.py export brad --out brad_export.json
+
+# Merge straight into wallets.json (updates existing + appends new)
+python discover.py export brad --merge
+
+# Skip Twitter search (faster, saves time when offline)
+python discover.py export brad --no-twitter --merge
+```
+
+The export applies the naming convention automatically:
+- **`BRAD`** (UPPERCASE) → main wallet (KolScan leaderboard first, else highest GMGN PnL)
+- **`brad`** (lowercase) → all alt wallets
+
+The output JSON is in the exact Photon terminal import format and can be pasted
+directly back into your tracker.
+
 ## Credit Usage Guide
 
 | Command | Credits | Notes |
