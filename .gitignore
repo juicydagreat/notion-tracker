@@ -1,0 +1,6 @@
+.env
+*.pyc
+__pycache__/
+discovery.db
+*.db
+.DS_Store

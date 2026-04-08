@@ -1,0 +1,14 @@
+[
+  {
+    "trackedWalletAddress": "REPLACE_WITH_YOUR_WALLET_ADDRESSES",
+    "name": "example",
+    "emoji": "👻",
+    "alertsOnFeed": true,
+    "alertsOnToast": false,
+    "alertsOnBubble": false,
+    "groups": [
+      "Main"
+    ],
+    "sound": "default"
+  }
+]
