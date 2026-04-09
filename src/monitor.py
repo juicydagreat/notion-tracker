@@ -34,7 +34,7 @@ from src.db import (
     save_candidate, save_token_purchase,
 )
 from src.wallets import WalletRegistry
-from src.matcher import MatchResult, _fee_confidence, temporal_token_scan
+from src.matcher import MatchResult, _fee_confidence, co_purchase_pattern_scan
 
 
 # ── Solana system / infrastructure program addresses ─────────────────────────
@@ -76,8 +76,8 @@ class MonitorConfig:
     min_fee_for_scan: int = DEFAULT_FEE_LAMPORTS + 1  # only scan if fee > default
     max_slots_per_cycle: int = 5          # block scans per poll cycle
     enable_token_boost: bool = True       # boost confidence on shared accounts
-    temporal_window: int = 300            # seconds window for temporal token scan
-    enable_temporal_scan: bool = True     # detect rebuys across different blocks
+    min_shared_tokens: int = 3            # co-purchase threshold to flag a pair
+    co_purchase_sweep_interval: int = 300 # seconds between co-purchase sweeps
 
 
 @dataclass
@@ -135,12 +135,16 @@ class WalletMonitor:
         # Pending block scans: slot -> list of (address, fee, sig) triggers
         self._pending_slots: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
 
+        # Track when we last ran a co-purchase sweep
+        self._last_co_purchase_sweep: float = 0.0
+
         # Stats
         self.stats = {
             "polls": 0,
             "new_txs": 0,
             "block_scans": 0,
             "candidates": 0,
+            "co_purchase_pairs": 0,
             "credits_used": 0,
         }
 
@@ -209,31 +213,31 @@ class WalletMonitor:
             entry.next_poll = time.monotonic() + interval
             heapq.heappush(self._heap, entry)
 
-            # Queue block scans for unique-fee new txs; run temporal scans inline
-            temporal_candidates: list[MatchResult] = []
+            # Queue block scans for unique-fee new txs
             for evt in new_txs:
-                # Same-block fee scan (expensive, deferred)
                 if evt.fee and evt.fee > self.cfg.min_fee_for_scan:
                     self._pending_slots[evt.slot].append(
                         (evt.address, evt.fee, evt.signature)
                     )
 
-                # Temporal token scan (cheap — pure DB query)
-                if self.cfg.enable_temporal_scan and evt.block_time and evt.token_mints:
-                    for mint in evt.token_mints:
-                        hits = temporal_token_scan(
-                            trigger_address=evt.address,
-                            token_mint=mint,
-                            block_time=evt.block_time,
-                            fee=evt.fee,
-                            registry=self.registry,
-                            window_seconds=self.cfg.temporal_window,
-                        )
-                        temporal_candidates.extend(hits)
-
-            if temporal_candidates and self.on_candidate:
-                self.stats["candidates"] += len(temporal_candidates)
-                await self.on_candidate(entry.address, temporal_candidates)
+            # Periodic co-purchase pattern sweep (pure DB, 0 credits)
+            # Runs every co_purchase_sweep_interval seconds, not every poll.
+            now_mono = time.monotonic()
+            if (now_mono - self._last_co_purchase_sweep
+                    >= self.cfg.co_purchase_sweep_interval):
+                self._last_co_purchase_sweep = now_mono
+                cp_results = co_purchase_pattern_scan(
+                    self.registry,
+                    min_shared=self.cfg.min_shared_tokens,
+                )
+                if cp_results and self.on_candidate:
+                    # Group by the first address as "trigger"
+                    new_pairs = [r for r in cp_results
+                                 if r.confidence >= 0.40]
+                    self.stats["co_purchase_pairs"] += len(new_pairs) // 2
+                    self.stats["candidates"] += len(new_pairs)
+                    if new_pairs:
+                        await self.on_candidate("co_purchase_sweep", new_pairs)
 
             # Run pending block scans (up to cap per iteration)
             scanned = 0

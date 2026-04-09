@@ -256,7 +256,7 @@ def save_token_purchase(
     block_time: int | None, fee: int | None, signature: str,
     path: str = DB_PATH,
 ):
-    """Record a token purchase for later temporal co-purchase matching."""
+    """Record a token purchase for later co-purchase pattern matching."""
     now = int(time.time())
     with get_db(path) as db:
         db.execute(
@@ -267,52 +267,75 @@ def save_token_purchase(
         )
 
 
-def get_token_co_buyers(
-    token_mint: str,
-    block_time: int,
-    window_seconds: int = 300,
-    path: str = DB_PATH,
-) -> list[dict]:
+def get_token_buyers(token_mint: str, path: str = DB_PATH) -> list[dict]:
     """
-    Return all recorded purchases of `token_mint` within ±window_seconds
-    of `block_time`, by any tracked wallet.
+    Return all wallets we've recorded buying `token_mint`, across all time.
+    Used to populate a token's buyer set for pattern matching.
     """
-    lo = block_time - window_seconds
-    hi = block_time + window_seconds
     with get_db(path) as db:
         rows = db.execute(
-            """SELECT address, token_mint, slot, block_time, fee, signature
+            """SELECT address, slot, block_time, fee, signature
                FROM token_purchases
                WHERE token_mint = ?
-                 AND block_time BETWEEN ? AND ?
-               ORDER BY ABS(block_time - ?) ASC""",
-            (token_mint, lo, hi, block_time),
+               ORDER BY slot ASC""",
+            (token_mint,),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 def count_shared_token_purchases(
     addr1: str, addr2: str,
-    window_seconds: int = 300,
     path: str = DB_PATH,
 ) -> int:
     """
-    Count how many distinct tokens addr1 and addr2 have both purchased
-    within `window_seconds` of each other.  Used to boost confidence when
-    the same pair repeatedly buys the same tokens around the same time.
+    Count how many distinct tokens both addr1 and addr2 have ever purchased.
+    No time window — consistency over the entire history is what matters.
     """
     with get_db(path) as db:
         row = db.execute(
             """
             SELECT COUNT(DISTINCT a.token_mint) as n
             FROM token_purchases a
-            JOIN token_purchases b
-              ON  a.token_mint = b.token_mint
-              AND ABS(a.block_time - b.block_time) <= ?
-            WHERE a.address = ?
-              AND b.address = ?
+            JOIN token_purchases b ON a.token_mint = b.token_mint
+            WHERE a.address = ? AND b.address = ?
             """,
-            (window_seconds, addr1, addr2),
+            (addr1, addr2),
         ).fetchone()
         return row["n"] if row else 0
+
+
+def get_co_purchase_pairs(
+    min_shared: int = 3,
+    path: str = DB_PATH,
+) -> list[dict]:
+    """
+    Find all wallet pairs that have purchased min_shared or more tokens
+    in common — across the full history, regardless of timing.
+
+    Returns rows: {addr1, addr2, shared_tokens, token_mints (comma-sep),
+                   fee_matches (count of purchases with same fee)}
+
+    This is the core "bucket" query: any pair above min_shared is a candidate
+    for being the same person operating multiple wallets.
+    """
+    with get_db(path) as db:
+        rows = db.execute(
+            """
+            SELECT
+                a.address                           AS addr1,
+                b.address                           AS addr2,
+                COUNT(DISTINCT a.token_mint)        AS shared_tokens,
+                GROUP_CONCAT(DISTINCT a.token_mint) AS token_mints,
+                SUM(CASE WHEN a.fee = b.fee
+                         AND a.fee IS NOT NULL THEN 1 ELSE 0 END) AS fee_matches
+            FROM token_purchases a
+            JOIN token_purchases b ON a.token_mint = b.token_mint
+            WHERE a.address < b.address
+            GROUP BY a.address, b.address
+            HAVING shared_tokens >= ?
+            ORDER BY shared_tokens DESC, fee_matches DESC
+            """,
+            (min_shared,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 

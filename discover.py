@@ -10,6 +10,7 @@ Commands:
   candidates             Show saved match candidates from DB
   refresh <name>         Re-fetch transaction data for a named cluster
   export <name> [addrs]  Export cluster as importable JSON with UPPER/lower naming
+  co-purchase [N]        Show wallet pairs with N+ tokens bought in common (default 3)
 """
 import asyncio
 import json
@@ -32,7 +33,9 @@ from src.matcher import (
     co_occurrence_scan,
     fetch_and_cache_wallet_sigs,
     funding_trace,
+    co_purchase_pattern_scan,
 )
+from src.db import get_co_purchase_pairs
 from src.output import export_cluster, write_export, merge_into_wallets_json
 from src.twitter import search_url as twitter_search_url
 from src.gmgn import wallet_page_url as gmgn_page_url
@@ -357,6 +360,74 @@ async def cmd_export(
         console.print(f"  … and {len(all_addrs) - 5} more")
 
 
+def cmd_co_purchase(registry: WalletRegistry, min_shared: int = 3):
+    """
+    Show wallet pairs that have bought min_shared or more tokens in common.
+
+    This is the "bucket" view — pairs accumulate here as the daemon runs.
+    No timing component: a wallet that consistently rebuys the same tokens
+    across days/weeks still shows up here.
+
+    Once a pair hits your confidence threshold, use `export` to produce
+    the importable JSON.
+    """
+    pairs = get_co_purchase_pairs(min_shared=min_shared)
+    if not pairs:
+        console.print(
+            f"[yellow]No pairs found with {min_shared}+ shared tokens.[/yellow]\n"
+            "[dim]Run the daemon to accumulate token purchase data, "
+            "then re-run this command.[/dim]"
+        )
+        return
+
+    t = Table(
+        title=f"Co-Purchase Pairs (≥{min_shared} shared tokens)",
+        box=box.ROUNDED,
+        show_lines=True,
+    )
+    t.add_column("Wallet A", style="cyan")
+    t.add_column("Wallet B", style="cyan")
+    t.add_column("Shared\nTokens", justify="right", style="bold")
+    t.add_column("Fee\nMatches", justify="right")
+    t.add_column("Confidence", justify="right")
+    t.add_column("Sample Tokens", style="dim")
+
+    for pair in pairs:
+        shared = pair["shared_tokens"]
+        fee_hits = pair["fee_matches"] or 0
+
+        # Mirror confidence formula from co_purchase_pattern_scan
+        conf = 0.40 + min((shared - min_shared) * 0.08, 0.48)
+        if fee_hits > 0:
+            conf = min(conf + 0.07, 0.95)
+        conf_color = "green" if conf >= 0.7 else "yellow" if conf >= 0.5 else "dim"
+
+        a_wallet = registry.get(pair["addr1"])
+        b_wallet = registry.get(pair["addr2"])
+        a_label = a_wallet.label if a_wallet else pair["addr1"][:16] + "…"
+        b_label = b_wallet.label if b_wallet else pair["addr1"][:16] + "…"
+
+        mints = (pair["token_mints"] or "").split(",")
+        sample = ", ".join(m[:8] + "…" for m in mints[:3])
+        if len(mints) > 3:
+            sample += f" +{len(mints) - 3} more"
+
+        t.add_row(
+            a_label,
+            b_label,
+            str(shared),
+            str(fee_hits),
+            f"[{conf_color}]{conf:.0%}[/{conf_color}]",
+            sample,
+        )
+
+    console.print(t)
+    console.print(
+        f"\n[dim]{len(pairs)} pairs. "
+        f"Use [bold]python discover.py export <name>[/bold] to produce importable JSON.[/dim]"
+    )
+
+
 def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
     """Show all saved match candidates from DB."""
     candidates = get_candidates(min_confidence=min_conf)
@@ -443,6 +514,12 @@ async def main():
         init_db()
         min_conf = float(args[1]) if len(args) > 1 else 0.5
         cmd_candidates(registry, min_conf)
+
+    elif cmd == "co-purchase":
+        registry = WalletRegistry()
+        init_db()
+        min_shared = int(args[1]) if len(args) > 1 else 3
+        cmd_co_purchase(registry, min_shared)
 
     elif cmd == "export":
         if len(args) < 2:

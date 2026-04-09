@@ -15,7 +15,8 @@ from src.helius import HeliusClient, BlockTx
 from src.db import (
     cache_signatures, cache_tx, get_cached_tx,
     get_wallet_slots, get_slots_multi, save_candidate,
-    get_token_co_buyers, count_shared_token_purchases,
+    get_token_buyers, count_shared_token_purchases,
+    get_co_purchase_pairs,
 )
 from src.wallets import WalletRegistry
 
@@ -265,88 +266,59 @@ async def funding_trace(
     return results
 
 
-def temporal_token_scan(
-    trigger_address: str,
-    token_mint: str,
-    block_time: int,
-    fee: Optional[int],
+def co_purchase_pattern_scan(
     registry: WalletRegistry,
-    window_seconds: int = 300,
+    min_shared: int = 3,
 ) -> list[MatchResult]:
     """
-    Find other tracked (or untracked) wallets that bought the same token
-    within `window_seconds` of `block_time`.
+    Find wallet pairs that have bought min_shared or more tokens in common —
+    across the entire purchase history, regardless of timing.
 
-    This catches the rebuy case: wallet A and an alt both buy the same
-    token but a few blocks apart (different slot → missed by same_block_fee_scan).
+    The core insight: timing between buys doesn't matter. A trader who uses
+    an alt wallet will consistently buy the same tokens on both — whether that's
+    simultaneously, hours apart, or days apart. Consistent overlap across
+    multiple tokens is the real signal.
 
-    Confidence scoring:
-      0.25  base  (same token, different block — weak alone)
-      +0.35 same fee lamports exactly — near-unique fingerprint
-      +0.20 within 60 seconds of each other
-      +0.10 within 60–180 seconds
-      +0.10 per additional shared token (pattern repeat, capped at +0.30)
+    Confidence scoring (time is NOT a factor):
+      min_shared tokens shared  → 0.40
+      each additional token     → +0.08 (capped at 0.88)
+      1+ fee fingerprint match  → +0.07 (same lamport amount on any shared tx)
+      max confidence            → 0.95
 
-    All signals together max out at ~0.95 (fee match + <60s + 3 shared tokens).
-    Without fee match, temporal-only matches cap at ~0.65 — saved but flagged
-    as low confidence until confirmed by another signal.
+    Pairs below min_shared are ignored — could be coincidence.
+    At 5+ shared tokens the pattern is very strong.
+    At 8+ it's near-certain without even needing fee confirmation.
     """
-    co_buyers = get_token_co_buyers(token_mint, block_time, window_seconds)
+    pairs = get_co_purchase_pairs(min_shared)
     results: list[MatchResult] = []
 
-    for record in co_buyers:
-        candidate = record["address"]
-        if candidate == trigger_address:
-            continue
+    for pair in pairs:
+        addr1, addr2 = pair["addr1"], pair["addr2"]
+        shared = pair["shared_tokens"]
+        fee_hits = pair["fee_matches"] or 0
+        token_list = (pair["token_mints"] or "").split(",")
 
-        conf = 0.25  # base: same token, different block
+        # Score based purely on pattern strength
+        conf = 0.40 + min((shared - min_shared) * 0.08, 0.48)
+        if fee_hits > 0:
+            conf = min(conf + 0.07, 0.95)
+        conf = round(conf, 2)
 
-        # Fee fingerprint match
-        if fee is not None and record.get("fee") == fee:
-            conf += 0.35
-
-        # Time proximity boost
-        time_diff = abs((record.get("block_time") or block_time) - block_time)
-        if time_diff <= 60:
-            conf += 0.20   # same minute
-        elif time_diff <= 180:
-            conf += 0.10   # within 3 minutes
-
-        # Pattern boost: how many OTHER tokens have they co-purchased?
-        shared = count_shared_token_purchases(
-            trigger_address, candidate, window_seconds
-        )
-        # Don't count the current token (it's what triggered this scan)
-        extra = max(shared - 1, 0)
-        conf += min(extra * 0.10, 0.30)
-
-        conf = min(round(conf, 2), 0.95)
-
-        w = registry.get(candidate)
-        evidence = {
-            "token_mint": token_mint,
-            "trigger_address": trigger_address,
-            "trigger_block_time": block_time,
-            "candidate_block_time": record.get("block_time"),
-            "time_diff_seconds": time_diff,
-            "fee_match": fee is not None and record.get("fee") == fee,
-            "trigger_fee": fee,
-            "candidate_fee": record.get("fee"),
-            "shared_token_count": shared,
-            "candidate_sig": record.get("signature"),
-            "window_seconds": window_seconds,
-        }
-
-        results.append(MatchResult(
-            address=candidate,
-            match_type="temporal_token",
-            confidence=conf,
-            evidence=evidence,
-            known_label=w.label if w else None,
-        ))
-        save_candidate(
-            candidate, trigger_address,
-            "temporal_token", conf, evidence,
-        )
+        for trigger, candidate in [(addr1, addr2), (addr2, addr1)]:
+            w = registry.get(candidate)
+            evidence = {
+                "shared_tokens": shared,
+                "token_mints": token_list[:10],   # cap to keep JSON small
+                "fee_fingerprint_matches": fee_hits,
+                "match_basis": "co_purchase_pattern",
+            }
+            results.append(MatchResult(
+                address=candidate,
+                match_type="co_purchase_pattern",
+                confidence=conf,
+                evidence=evidence,
+                known_label=w.label if w else None,
+            ))
+            save_candidate(candidate, trigger, "co_purchase_pattern", conf, evidence)
 
     return sorted(results, key=lambda r: -r.confidence)
