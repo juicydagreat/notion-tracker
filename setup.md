@@ -86,5 +86,81 @@ directly back into your tracker.
 | `scan-block` | ~12 | 1 for tx + ~10 for block |
 | `scan-cluster` | 0 (cached) | Uses local DB after refresh |
 | `trace` | ~5-20 | Depends on depth |
+| `export` | 0 | No Helius calls needed |
+| `daemon` (idle) | ~1/wallet/cycle | No block scans until unique fee seen |
+| `daemon` (active) | +10/block scan | Only for non-default fees, cached after first scan |
 
 **Budget:** Set `MAX_CREDITS_PER_RUN` in `.env` to limit spending per session.
+
+---
+
+## Continuous Discovery Daemon
+
+Runs in the background, watches all your tracked wallets for new transactions,
+and automatically identifies alt wallets when unique fee fingerprints appear.
+
+### How it works
+
+```
+Tracked wallet makes a tx with fee 42,000 lamports
+  → daemon detects new tx within 60 seconds
+  → fetches the block (~10 credits, cached forever after)
+  → scans all block txs for same fee (42,000)
+  → if candidate also touched the same Raydium pool/token mint → confidence boosted
+  → saves to discovery.db
+```
+
+### Run the daemon
+
+```bash
+# Monitor all wallets (recommended: set --max-credits to stay in budget)
+python daemon.py --max-credits 300
+
+# Only watch a specific cluster
+python daemon.py --cluster brad --max-credits 100
+
+# Faster polling for active sessions
+python daemon.py --interval 30 --idle-interval 300
+
+# Disable token-account confidence boost
+python daemon.py --no-token-boost
+```
+
+### Daemon flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cluster <name>` | all wallets | Only monitor this cluster |
+| `--max-credits N` | from .env | Stop after N Helius credits |
+| `--interval N` | 60s | Poll interval for active wallets |
+| `--idle-interval N` | 600s | Poll interval for idle wallets |
+| `--no-token-boost` | boost on | Disable shared-account confidence boost |
+| `--min-confidence F` | 0.5 | Minimum confidence for display |
+
+### Credit budget planning
+
+With 700 wallets and default intervals:
+- Active wallets (recent tx): polled every 60s → ~1 credit/min each
+- Idle wallets: polled every 600s → very low cost
+- Block scans: only trigger on non-default fees, cached → typically 10-20 credits/hour
+- **Recommended**: `--max-credits 200` for a safe hourly budget
+
+### Workflow
+
+```bash
+# 1. Import your wallets
+python scripts/import_wallets.py path/to/export.json
+
+# 2. Do an initial cache warm-up (run once)
+python discover.py refresh all   # or refresh by cluster
+
+# 3. Run the daemon
+python daemon.py --max-credits 200
+
+# 4. Check what was found (in another terminal)
+python discover.py candidates 0.7
+
+# 5. Export a confirmed cluster to importable JSON
+python discover.py export brad --merge
+```
+

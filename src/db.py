@@ -172,3 +172,60 @@ def mark_confirmed(address: str, path: str = DB_PATH):
             "UPDATE candidates SET confirmed = 1 WHERE address = ?",
             (address,),
         )
+
+
+# ── Monitor helpers ──────────────────────────────────────────────────────────
+
+def get_last_signature(address: str, path: str = DB_PATH) -> str | None:
+    """Return the most recently cached signature for a wallet (highest slot)."""
+    with get_db(path) as db:
+        row = db.execute(
+            """SELECT signature FROM wallet_sigs
+               WHERE address = ? ORDER BY slot DESC LIMIT 1""",
+            (address,),
+        ).fetchone()
+        return row["signature"] if row else None
+
+
+def is_slot_scanned(slot: int, path: str = DB_PATH) -> bool:
+    """Return True if we've already fetched this block's transactions."""
+    with get_db(path) as db:
+        row = db.execute(
+            "SELECT 1 FROM block_cache WHERE slot = ?", (slot,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_slot_scanned(slot: int, tx_count: int = 0, path: str = DB_PATH):
+    """Record that we've fully scanned this block slot."""
+    now = int(time.time())
+    with get_db(path) as db:
+        db.execute(
+            """INSERT OR REPLACE INTO block_cache (slot, tx_count, fetched_at)
+               VALUES (?, ?, ?)""",
+            (slot, tx_count, now),
+        )
+
+
+def get_recent_candidates(since_ts: int, path: str = DB_PATH) -> list[dict]:
+    """Return candidates discovered after `since_ts` (Unix timestamp)."""
+    with get_db(path) as db:
+        rows = db.execute(
+            """SELECT * FROM candidates
+               WHERE first_seen >= ? ORDER BY first_seen DESC""",
+            (since_ts,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_recent_txs(address: str, since_ts: int,
+                     path: str = DB_PATH) -> int:
+    """Count cached txs for a wallet after a given timestamp."""
+    with get_db(path) as db:
+        row = db.execute(
+            """SELECT COUNT(*) as n FROM wallet_sigs
+               WHERE address = ? AND block_time >= ? AND err = 0""",
+            (address, since_ts),
+        ).fetchone()
+        return row["n"] if row else 0
+

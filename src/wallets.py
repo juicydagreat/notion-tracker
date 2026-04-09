@@ -56,6 +56,9 @@ class WalletRegistry:
     def all(self) -> list[TrackedWallet]:
         return list(self._wallets.values())
 
+    # Alias used by daemon / refresh-all workflows
+    all_wallets = all
+
     def all_addresses(self) -> set[str]:
         return set(self._wallets.keys())
 

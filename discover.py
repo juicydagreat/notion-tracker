@@ -212,15 +212,21 @@ async def cmd_trace(address: str, registry: WalletRegistry):
 
 
 async def cmd_refresh(name: str, registry: WalletRegistry):
-    """Fetch fresh transaction data for a cluster into local cache."""
-    wallets = registry.by_name(name)
+    """Fetch fresh transaction data for a cluster (or all wallets) into local cache."""
+    if name.lower() == "all":
+        wallets = registry.all_wallets()
+        label = f"all wallets ({len(wallets)})"
+    else:
+        wallets = registry.by_name(name)
+        label = f"'{name}' ({len(wallets)} wallets)"
+
     if not wallets:
         console.print(f"[red]No wallets found:[/red] {name}")
         return
 
     client = HeliusClient()
     try:
-        console.print(f"[cyan]Refreshing tx data for '{name}' ({len(wallets)} wallets)...[/cyan]")
+        console.print(f"[cyan]Refreshing tx data for {label}...[/cyan]")
         for w in wallets:
             console.print(f"  Fetching {w.display}...", end="")
             slots = await fetch_and_cache_wallet_sigs(w.address, client, limit=100)
