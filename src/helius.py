@@ -1,11 +1,18 @@
 """
 Helius API client - credit-aware, rate-limited.
 
-Credit costs (approximate):
-  getSignaturesForAddress: 1 credit per call (up to 1000 sigs)
-  getTransaction:          1 credit per tx
-  getBlock:                ~100 credits (avoid where possible)
-  getAccountInfo:          1 credit
+Dual-RPC mode (default):
+  getSignaturesForAddress → FREE_RPC_URL  (0 Helius credits)
+  getTransaction          → FREE_RPC_URL  (0 Helius credits)
+  getBlock                → HELIUS_RPC_URL (~10 credits, cached forever)
+  getAccountInfo          → FREE_RPC_URL  (0 Helius credits)
+
+This means Helius credits are only consumed when a non-default fee tx is
+detected and we need the full block data — rare, high-value, cached.
+
+Set FREE_RPC_URL in .env to override the free endpoint.
+Alternatives: https://rpc.ankr.com/solana
+              https://solana-mainnet.g.alchemy.com/v2/demo
 """
 import asyncio
 import time
@@ -14,7 +21,7 @@ from typing import Optional, Any
 
 import httpx
 
-from src.config import HELIUS_RPC_URL, HELIUS_API_KEY, MAX_CREDITS_PER_RUN
+from src.config import HELIUS_RPC_URL, HELIUS_API_KEY, FREE_RPC_URL, MAX_CREDITS_PER_RUN
 
 
 @dataclass
@@ -37,12 +44,24 @@ class BlockTx:
 
 
 class HeliusClient:
-    def __init__(self):
+    def __init__(self, use_free_rpc: bool = True):
+        """
+        Args:
+            use_free_rpc: Route signatures/transactions through the free public
+                          Solana RPC instead of Helius. Helius credits are then
+                          only spent on getBlock calls. Default: True.
+        """
         self._client = httpx.AsyncClient(timeout=30.0)
         self._credits_used = 0
-        self._last_request = 0.0
+        self._use_free_rpc = use_free_rpc
+
         # Helius rate limit: ~10 req/s on free, 50 req/s on paid
-        self._min_interval = 0.1
+        self._helius_last = 0.0
+        self._helius_interval = 0.12   # ~8 req/s — safe for free tier
+
+        # Public RPC: be gentle (~4 req/s to avoid 429s)
+        self._free_last = 0.0
+        self._free_interval = 0.25
 
     @property
     def credits_used(self) -> int:
@@ -54,21 +73,23 @@ class HeliusClient:
                 f"Credit budget exhausted ({self._credits_used}/{MAX_CREDITS_PER_RUN})"
             )
 
-    async def _throttle(self):
-        elapsed = time.monotonic() - self._last_request
-        if elapsed < self._min_interval:
-            await asyncio.sleep(self._min_interval - elapsed)
-        self._last_request = time.monotonic()
+    async def _throttle_helius(self):
+        elapsed = time.monotonic() - self._helius_last
+        if elapsed < self._helius_interval:
+            await asyncio.sleep(self._helius_interval - elapsed)
+        self._helius_last = time.monotonic()
+
+    async def _throttle_free(self):
+        elapsed = time.monotonic() - self._free_last
+        if elapsed < self._free_interval:
+            await asyncio.sleep(self._free_interval - elapsed)
+        self._free_last = time.monotonic()
 
     async def _rpc(self, method: str, params: list, cost: int = 1) -> Any:
+        """Paid Helius RPC call — counts against credit budget."""
         self._check_budget(cost)
-        await self._throttle()
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        }
+        await self._throttle_helius()
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         resp = await self._client.post(HELIUS_RPC_URL, json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -77,17 +98,39 @@ class HeliusClient:
         self._credits_used += cost
         return data.get("result")
 
+    async def _free_rpc(self, method: str, params: list) -> Any:
+        """
+        Free public RPC call — zero Helius credits.
+        Falls back to Helius if the free RPC returns an error or is unreachable.
+        """
+        await self._throttle_free()
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        try:
+            resp = await self._client.post(FREE_RPC_URL, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" not in data:
+                return data.get("result")
+        except Exception:
+            pass
+        # Fallback to Helius (costs 1 credit)
+        return await self._rpc(method, params, cost=1)
+
     async def get_signatures(
         self,
         address: str,
         limit: int = 100,
         before: Optional[str] = None,
     ) -> list[TxSummary]:
-        """Get recent transaction signatures for a wallet. 1 credit."""
+        """
+        Get recent transaction signatures for a wallet.
+        Uses free RPC by default (0 Helius credits); falls back to Helius.
+        """
         params: list[Any] = [address, {"limit": min(limit, 1000)}]
         if before:
             params[1]["before"] = before
-        result = await self._rpc("getSignaturesForAddress", params, cost=1)
+        call = self._free_rpc if self._use_free_rpc else lambda m, p: self._rpc(m, p, 1)
+        result = await call("getSignaturesForAddress", params)
         if not result:
             return []
         return [
@@ -101,13 +144,13 @@ class HeliusClient:
         ]
 
     async def get_transaction(self, signature: str) -> Optional[dict]:
-        """Get full transaction details including fee. 1 credit."""
-        result = await self._rpc(
-            "getTransaction",
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-            cost=1,
-        )
-        return result
+        """
+        Get full transaction details including fee.
+        Uses free RPC by default (0 Helius credits); falls back to Helius.
+        """
+        params = [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        call = self._free_rpc if self._use_free_rpc else lambda m, p: self._rpc(m, p, 1)
+        return await call("getTransaction", params)
 
     async def get_transaction_fee(self, signature: str) -> Optional[tuple[int, str]]:
         """
@@ -193,13 +236,10 @@ class HeliusClient:
         return results
 
     async def get_account_info(self, address: str) -> Optional[dict]:
-        """Get account info (SOL balance etc). 1 credit."""
-        result = await self._rpc(
-            "getAccountInfo",
-            [address, {"encoding": "base58"}],
-            cost=1,
-        )
-        return result
+        """Get account info (SOL balance etc). Uses free RPC by default."""
+        params = [address, {"encoding": "base58"}]
+        call = self._free_rpc if self._use_free_rpc else lambda m, p: self._rpc(m, p, 1)
+        return await call("getAccountInfo", params)
 
     async def close(self):
         await self._client.aclose()

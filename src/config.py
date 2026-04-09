@@ -8,6 +8,15 @@ HELIUS_RPC_URL = os.getenv(
     "HELIUS_RPC_URL",
     f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 )
+
+# Free public Solana RPC — used for getSignaturesForAddress and getTransaction
+# so Helius credits are only spent on getBlock (expensive, rare, cached).
+# Alternatives: https://rpc.ankr.com/solana  |  https://solana-mainnet.g.alchemy.com/v2/demo
+FREE_RPC_URL = os.getenv(
+    "FREE_RPC_URL",
+    "https://api.mainnet-beta.solana.com"
+)
+
 WALLETS_FILE = os.getenv("WALLETS_FILE", "wallets.json")
 DB_PATH = os.getenv("DB_PATH", "discovery.db")
 MAX_CREDITS_PER_RUN = int(os.getenv("MAX_CREDITS_PER_RUN", "500"))
