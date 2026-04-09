@@ -11,7 +11,9 @@ Commands:
   refresh <name>         Re-fetch transaction data for a named cluster
   export <name> [addrs]  Export cluster as importable JSON with UPPER/lower naming
   co-purchase [N]        Show wallet pairs with N+ tokens bought in common (default 3)
-  sell-clusters [window] Show wallets that sell same tokens together (default 120s window)
+  sell-clusters [window] Show wallets that sell same tokens together (default 10s window)
+  dune-scan              Fetch Dune historical results and import into candidates DB
+  dune-setup             Print Dune query setup instructions
 """
 import asyncio
 import json
@@ -24,7 +26,7 @@ from rich.panel import Panel
 from rich import box
 from rich.text import Text
 
-from src.config import HELIUS_API_KEY, DB_PATH
+from src.config import HELIUS_API_KEY, DB_PATH, DUNE_API_KEY, DUNE_SELL_QUERY_ID, DUNE_COPURCHASE_QUERY_ID
 from src.db import init_db, get_candidates
 from src.wallets import WalletRegistry
 from src.analysis import summary, cluster_by_group
@@ -429,7 +431,7 @@ def cmd_co_purchase(registry: WalletRegistry, min_shared: int = 3):
     )
 
 
-def cmd_sell_clusters(registry: WalletRegistry, window_seconds: int = 120):
+def cmd_sell_clusters(registry: WalletRegistry, window_seconds: int = 10):
     """
     Show wallet pairs that have sold the same token within window_seconds of each other.
 
@@ -501,10 +503,10 @@ def cmd_sell_clusters(registry: WalletRegistry, window_seconds: int = 120):
     console.print(t)
 
     # Highlight near-simultaneous pairs (strongest signal)
-    hot = [p for p in pairs if (p.get("avg_time_diff_seconds") or 999) <= 10]
+    hot = [p for p in pairs if (p.get("avg_time_diff_seconds") or 999) <= 2]
     if hot:
         console.print(
-            f"\n[green bold]⚡ {len(hot)} pair(s) sold within 10s of each other "
+            f"\n[green bold]⚡ {len(hot)} pair(s) sold within 2s of each other "
             f"— near-certain 'sell all' signal[/green bold]"
         )
 
@@ -512,6 +514,87 @@ def cmd_sell_clusters(registry: WalletRegistry, window_seconds: int = 120):
         f"\n[dim]{len(pairs)} pairs. "
         f"Use [bold]python discover.py export <name>[/bold] to produce importable JSON.[/dim]"
     )
+
+
+async def cmd_dune_scan(registry: WalletRegistry, force_fresh: bool = False):
+    """
+    Fetch Dune Analytics results and import into the candidates database.
+
+    By default fetches cached results from your scheduled Dune queries (0 credits).
+    Use --fresh to force a new execution (costs Dune execution credits).
+
+    Requires DUNE_API_KEY, DUNE_SELL_QUERY_ID, and DUNE_COPURCHASE_QUERY_ID in .env.
+    Run `python discover.py dune-setup` for setup instructions.
+    """
+    from src.dune import DuneClient, import_sell_clusters, import_co_purchases
+
+    if not DUNE_API_KEY:
+        console.print(
+            "[red]DUNE_API_KEY not set.[/red] "
+            "Run [bold]python discover.py dune-setup[/bold] for instructions."
+        )
+        return
+
+    wallets = list(registry.all_addresses())
+    client = DuneClient(DUNE_API_KEY)
+
+    try:
+        total_imported = 0
+
+        # Sell cluster scan
+        if DUNE_SELL_QUERY_ID:
+            console.print(f"[cyan]Fetching sell clusters from Dune (query {DUNE_SELL_QUERY_ID})…[/cyan]")
+            try:
+                rows = await client.run_sell_cluster_scan(
+                    DUNE_SELL_QUERY_ID, wallets, use_cache=not force_fresh
+                )
+                n = import_sell_clusters(rows, registry)
+                console.print(f"  [green]✓[/green] {len(rows)} sell-cluster pairs → {n} candidates saved")
+                total_imported += n
+
+                # Show top results inline
+                if rows:
+                    t = Table(box=box.SIMPLE, show_header=True)
+                    t.add_column("Wallet A", style="cyan")
+                    t.add_column("Wallet B", style="cyan")
+                    t.add_column("Co-sells", justify="right", style="bold")
+                    t.add_column("Avg Δt", justify="right")
+                    for row in rows[:10]:
+                        a = registry.get(row["addr1"])
+                        b = registry.get(row["addr2"])
+                        t.add_row(
+                            a.label if a else row["addr1"][:14] + "…",
+                            b.label if b else row["addr2"][:14] + "…",
+                            str(row.get("co_sell_count", "?")),
+                            f"{row.get('avg_time_diff_seconds', '?'):.1f}s",
+                        )
+                    console.print(t)
+            except Exception as e:
+                console.print(f"  [red]Sell scan failed:[/red] {e}")
+        else:
+            console.print("[dim]DUNE_SELL_QUERY_ID not set — skipping sell scan[/dim]")
+
+        # Co-purchase scan
+        if DUNE_COPURCHASE_QUERY_ID:
+            console.print(f"\n[cyan]Fetching co-purchase patterns from Dune (query {DUNE_COPURCHASE_QUERY_ID})…[/cyan]")
+            try:
+                rows = await client.run_co_purchase_scan(
+                    DUNE_COPURCHASE_QUERY_ID, wallets, use_cache=not force_fresh
+                )
+                n = import_co_purchases(rows, registry)
+                console.print(f"  [green]✓[/green] {len(rows)} co-purchase pairs → {n} candidates saved")
+                total_imported += n
+            except Exception as e:
+                console.print(f"  [red]Co-purchase scan failed:[/red] {e}")
+        else:
+            console.print("[dim]DUNE_COPURCHASE_QUERY_ID not set — skipping co-purchase scan[/dim]")
+
+        console.print(
+            f"\n[bold]Done.[/bold] {total_imported} total candidates imported. "
+            f"View with: [bold]python discover.py candidates 0.6[/bold]"
+        )
+    finally:
+        await client.close()
 
 
 def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
@@ -610,8 +693,18 @@ async def main():
     elif cmd == "sell-clusters":
         registry = WalletRegistry()
         init_db()
-        window = int(args[1]) if len(args) > 1 else 120
+        window = int(args[1]) if len(args) > 1 else 10
         cmd_sell_clusters(registry, window)
+
+    elif cmd == "dune-scan":
+        registry = WalletRegistry()
+        init_db()
+        force = "--fresh" in args
+        await cmd_dune_scan(registry, force_fresh=force)
+
+    elif cmd == "dune-setup":
+        from src.dune import print_query_setup_guide
+        print_query_setup_guide()
 
     elif cmd == "export":
         if len(args) < 2:

@@ -358,7 +358,7 @@ def get_coordinated_sell_partners(
     token_mint: str,
     block_time: int,
     exclude_address: str,
-    window_seconds: int = 120,
+    window_seconds: int = 10,
     path: str = DB_PATH,
 ) -> list[dict]:
     """
@@ -391,7 +391,7 @@ def get_coordinated_sell_partners(
 def count_coordinated_sells(
     addr1: str,
     addr2: str,
-    window_seconds: int = 120,
+    window_seconds: int = 10,
     path: str = DB_PATH,
 ) -> int:
     """
@@ -417,7 +417,7 @@ def count_coordinated_sells(
 
 
 def get_sell_cluster_pairs(
-    window_seconds: int = 120,
+    window_seconds: int = 10,
     min_co_sells: int = 1,
     path: str = DB_PATH,
 ) -> list[dict]:
