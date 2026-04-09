@@ -243,3 +243,53 @@ class HeliusClient:
 
     async def close(self):
         await self._client.aclose()
+
+
+# ── Helpers (no client needed) ────────────────────────────────────────────────
+
+# Well-known non-token mints to exclude (wrapped SOL is fine to include)
+_EXCLUDED_MINTS: frozenset[str] = frozenset({
+    "11111111111111111111111111111111",               # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token Program
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",  # Token-2022
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bRS", # ATA Program
+    "ComputeBudget111111111111111111111111111111",    # Compute Budget
+})
+
+
+def extract_token_mints(tx_data: dict) -> list[str]:
+    """
+    Extract token mint addresses from a parsed getTransaction response.
+
+    Uses `meta.preTokenBalances` / `meta.postTokenBalances` — the most
+    reliable source; falls back to scanning inner instructions for
+    `mintTo` / `transfer` parsed data.
+
+    Returns a deduplicated list of mint addresses (excluding known programs).
+    """
+    if not tx_data:
+        return []
+    meta = tx_data.get("meta") or {}
+    mints: set[str] = set()
+
+    # Primary: token balance change entries contain the mint directly
+    for balance_list in (
+        meta.get("preTokenBalances") or [],
+        meta.get("postTokenBalances") or [],
+    ):
+        for entry in balance_list:
+            mint = entry.get("mint")
+            if mint and mint not in _EXCLUDED_MINTS:
+                mints.add(mint)
+
+    # Secondary: parsed inner instructions (e.g. Jupiter routes)
+    inner = meta.get("innerInstructions") or []
+    for block in inner:
+        for ix in block.get("instructions") or []:
+            parsed = ix.get("parsed") or {}
+            info = parsed.get("info") or {}
+            mint = info.get("mint")
+            if mint and mint not in _EXCLUDED_MINTS:
+                mints.add(mint)
+
+    return list(mints)

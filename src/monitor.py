@@ -1,16 +1,23 @@
 """
 Continuous wallet monitor — polls tracked wallets for new transactions and
-automatically triggers same-block fee matching when unique fees are detected.
+automatically triggers:
 
-Token co-buyer detection:
-  When two wallets in the same block share a non-trivial program/pool account
-  (e.g., the same Raydium pool, token mint, or Jito tip account) in addition
-  to having the same fee, confidence is boosted to 0.95+.
+  1. Same-block fee matching  — same slot + same fee (strongest signal)
+  2. Temporal token matching  — same token within ±N minutes, different block
+                                (catches rebuys and staggered entries)
+
+Token co-buyer detection (in-block):
+  Same block + same fee + shared DEX pool/token account → confidence 0.85-0.97
+
+Temporal token detection (cross-block):
+  Same token mint, different block, within 5-minute window.
+  Confidence layers:
+    0.25 base | +0.35 same fee | +0.20 within 60s | +0.10/shared token pattern
 
 Credit budget:
-  - 1 credit per wallet poll (getSignaturesForAddress)
-  - ~10 credits per block scan (getBlock), skipped if slot already in cache
-  - Block scans only triggered when fee > DEFAULT_FEE_LAMPORTS
+  - Signature polling → free public RPC (0 Helius credits)
+  - getTransaction for fee + mints → free public RPC (0 Helius credits)
+  - getBlock → Helius only, ~10 credits, triggered by unique fees, cached forever
 """
 import asyncio
 import heapq
@@ -20,14 +27,14 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Optional
 
 from src.config import DEFAULT_FEE_LAMPORTS, MAX_CREDITS_PER_RUN
-from src.helius import HeliusClient, BlockTx
+from src.helius import HeliusClient, BlockTx, extract_token_mints
 from src.db import (
     cache_signatures, cache_tx, get_cached_tx,
     get_last_signature, is_slot_scanned, mark_slot_scanned,
-    save_candidate,
+    save_candidate, save_token_purchase,
 )
 from src.wallets import WalletRegistry
-from src.matcher import MatchResult, _fee_confidence
+from src.matcher import MatchResult, _fee_confidence, temporal_token_scan
 
 
 # ── Solana system / infrastructure program addresses ─────────────────────────
@@ -69,6 +76,8 @@ class MonitorConfig:
     min_fee_for_scan: int = DEFAULT_FEE_LAMPORTS + 1  # only scan if fee > default
     max_slots_per_cycle: int = 5          # block scans per poll cycle
     enable_token_boost: bool = True       # boost confidence on shared accounts
+    temporal_window: int = 300            # seconds window for temporal token scan
+    enable_temporal_scan: bool = True     # detect rebuys across different blocks
 
 
 @dataclass
@@ -79,6 +88,7 @@ class NewTxEvent:
     slot: int
     fee: Optional[int] = None
     block_time: Optional[int] = None
+    token_mints: list[str] = field(default_factory=list)
 
 
 # Type alias for the candidate callback
@@ -199,12 +209,31 @@ class WalletMonitor:
             entry.next_poll = time.monotonic() + interval
             heapq.heappush(self._heap, entry)
 
-            # Queue block scans for unique-fee new txs
+            # Queue block scans for unique-fee new txs; run temporal scans inline
+            temporal_candidates: list[MatchResult] = []
             for evt in new_txs:
+                # Same-block fee scan (expensive, deferred)
                 if evt.fee and evt.fee > self.cfg.min_fee_for_scan:
                     self._pending_slots[evt.slot].append(
                         (evt.address, evt.fee, evt.signature)
                     )
+
+                # Temporal token scan (cheap — pure DB query)
+                if self.cfg.enable_temporal_scan and evt.block_time and evt.token_mints:
+                    for mint in evt.token_mints:
+                        hits = temporal_token_scan(
+                            trigger_address=evt.address,
+                            token_mint=mint,
+                            block_time=evt.block_time,
+                            fee=evt.fee,
+                            registry=self.registry,
+                            window_seconds=self.cfg.temporal_window,
+                        )
+                        temporal_candidates.extend(hits)
+
+            if temporal_candidates and self.on_candidate:
+                self.stats["candidates"] += len(temporal_candidates)
+                await self.on_candidate(entry.address, temporal_candidates)
 
             # Run pending block scans (up to cap per iteration)
             scanned = 0
@@ -260,25 +289,59 @@ class WalletMonitor:
         ])
         self.stats["new_txs"] += len(new)
 
-        # Fetch fees for non-error txs (only those with unknown fee)
+        # Fetch full tx data for each new non-error tx.
+        # Via free public RPC → 0 Helius credits.
+        # Extracts both fee (for block scan) and token mints (for temporal scan).
         events = []
         for s in new:
             if s.err:
                 continue
+
+            fee: Optional[int] = None
+            mints: list[str] = []
+
             cached = get_cached_tx(s.signature)
             if cached and cached.get("fee") is not None:
                 fee = cached["fee"]
-            else:
-                # Only fetch full tx if we need the fee and can afford it
-                if self.client.credits_used + 1 < MAX_CREDITS_PER_RUN:
-                    result = await self.client.get_transaction_fee(s.signature)
-                    if result:
-                        fee, payer = result
-                        cache_tx(s.signature, s.slot, fee, payer, s.block_time)
-                    else:
-                        fee = None
-                else:
-                    fee = None
+                # Mints not stored in tx_cache — fetch full tx below
+
+            # Fetch the full transaction (free RPC, 0 credits)
+            try:
+                tx_data = await self.client.get_transaction(s.signature)
+            except Exception:
+                tx_data = None
+
+            if tx_data:
+                meta = tx_data.get("meta") or {}
+                if fee is None:
+                    fee = meta.get("fee")
+                    # Extract fee_payer and cache
+                    accounts = (
+                        tx_data.get("transaction", {})
+                        .get("message", {})
+                        .get("accountKeys", [])
+                    )
+                    fee_payer = None
+                    for acc in accounts:
+                        if isinstance(acc, dict):
+                            if acc.get("signer") and acc.get("writable"):
+                                fee_payer = acc.get("pubkey")
+                                break
+                        elif isinstance(acc, str) and fee_payer is None:
+                            fee_payer = acc
+                    if fee is not None:
+                        cache_tx(s.signature, s.slot, fee, fee_payer or address,
+                                 s.block_time)
+
+                # Extract token mints (free — already have the tx data)
+                mints = extract_token_mints(tx_data)
+
+                # Save each token purchase for temporal cross-matching
+                if mints and s.block_time:
+                    for mint in mints:
+                        save_token_purchase(
+                            address, mint, s.slot, s.block_time, fee, s.signature
+                        )
 
             events.append(NewTxEvent(
                 address=address,
@@ -286,6 +349,7 @@ class WalletMonitor:
                 slot=s.slot,
                 fee=fee,
                 block_time=s.block_time,
+                token_mints=mints,
             ))
 
         return events

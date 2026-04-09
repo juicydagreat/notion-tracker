@@ -1,8 +1,9 @@
 """
 Core matching logic:
-  1. same_block_fee_scan   - given a tx, find wallets in same block with same fee
-  2. co_occurrence_scan    - find unknown wallets that repeatedly co-occur in same slots
-  3. funding_trace         - trace SOL inflows to find common funding ancestors
+  1. same_block_fee_scan     - wallets in same block with same fee
+  2. co_occurrence_scan      - wallets that repeatedly co-occur in same slots
+  3. funding_trace           - SOL inflow chain tracing
+  4. temporal_token_scan     - same token bought within a time window (rebuys)
 """
 import asyncio
 from collections import Counter, defaultdict
@@ -14,6 +15,7 @@ from src.helius import HeliusClient, BlockTx
 from src.db import (
     cache_signatures, cache_tx, get_cached_tx,
     get_wallet_slots, get_slots_multi, save_candidate,
+    get_token_co_buyers, count_shared_token_purchases,
 )
 from src.wallets import WalletRegistry
 
@@ -261,3 +263,90 @@ async def funding_trace(
             save_candidate(address, ancestor, "funding", conf, evidence)
 
     return results
+
+
+def temporal_token_scan(
+    trigger_address: str,
+    token_mint: str,
+    block_time: int,
+    fee: Optional[int],
+    registry: WalletRegistry,
+    window_seconds: int = 300,
+) -> list[MatchResult]:
+    """
+    Find other tracked (or untracked) wallets that bought the same token
+    within `window_seconds` of `block_time`.
+
+    This catches the rebuy case: wallet A and an alt both buy the same
+    token but a few blocks apart (different slot → missed by same_block_fee_scan).
+
+    Confidence scoring:
+      0.25  base  (same token, different block — weak alone)
+      +0.35 same fee lamports exactly — near-unique fingerprint
+      +0.20 within 60 seconds of each other
+      +0.10 within 60–180 seconds
+      +0.10 per additional shared token (pattern repeat, capped at +0.30)
+
+    All signals together max out at ~0.95 (fee match + <60s + 3 shared tokens).
+    Without fee match, temporal-only matches cap at ~0.65 — saved but flagged
+    as low confidence until confirmed by another signal.
+    """
+    co_buyers = get_token_co_buyers(token_mint, block_time, window_seconds)
+    results: list[MatchResult] = []
+
+    for record in co_buyers:
+        candidate = record["address"]
+        if candidate == trigger_address:
+            continue
+
+        conf = 0.25  # base: same token, different block
+
+        # Fee fingerprint match
+        if fee is not None and record.get("fee") == fee:
+            conf += 0.35
+
+        # Time proximity boost
+        time_diff = abs((record.get("block_time") or block_time) - block_time)
+        if time_diff <= 60:
+            conf += 0.20   # same minute
+        elif time_diff <= 180:
+            conf += 0.10   # within 3 minutes
+
+        # Pattern boost: how many OTHER tokens have they co-purchased?
+        shared = count_shared_token_purchases(
+            trigger_address, candidate, window_seconds
+        )
+        # Don't count the current token (it's what triggered this scan)
+        extra = max(shared - 1, 0)
+        conf += min(extra * 0.10, 0.30)
+
+        conf = min(round(conf, 2), 0.95)
+
+        w = registry.get(candidate)
+        evidence = {
+            "token_mint": token_mint,
+            "trigger_address": trigger_address,
+            "trigger_block_time": block_time,
+            "candidate_block_time": record.get("block_time"),
+            "time_diff_seconds": time_diff,
+            "fee_match": fee is not None and record.get("fee") == fee,
+            "trigger_fee": fee,
+            "candidate_fee": record.get("fee"),
+            "shared_token_count": shared,
+            "candidate_sig": record.get("signature"),
+            "window_seconds": window_seconds,
+        }
+
+        results.append(MatchResult(
+            address=candidate,
+            match_type="temporal_token",
+            confidence=conf,
+            evidence=evidence,
+            known_label=w.label if w else None,
+        ))
+        save_candidate(
+            candidate, trigger_address,
+            "temporal_token", conf, evidence,
+        )
+
+    return sorted(results, key=lambda r: -r.confidence)

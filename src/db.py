@@ -63,6 +63,25 @@ def init_db(path: str = DB_PATH):
             added_at        INTEGER NOT NULL,
             PRIMARY KEY (cluster_name, address)
         );
+
+        -- Every token purchase we observe for any tracked wallet.
+        -- Used for temporal co-purchase matching (same token, different block).
+        CREATE TABLE IF NOT EXISTS token_purchases (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            address     TEXT NOT NULL,        -- wallet that bought
+            token_mint  TEXT NOT NULL,        -- token mint address
+            slot        INTEGER NOT NULL,
+            block_time  INTEGER,
+            fee         INTEGER,              -- lamports (for fee-pattern boost)
+            signature   TEXT NOT NULL,
+            fetched_at  INTEGER NOT NULL,
+            UNIQUE (address, signature, token_mint)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tp_mint_time
+            ON token_purchases(token_mint, block_time);
+        CREATE INDEX IF NOT EXISTS idx_tp_address
+            ON token_purchases(address);
     """)
     con.commit()
     con.close()
@@ -226,6 +245,74 @@ def count_recent_txs(address: str, since_ts: int,
             """SELECT COUNT(*) as n FROM wallet_sigs
                WHERE address = ? AND block_time >= ? AND err = 0""",
             (address, since_ts),
+        ).fetchone()
+        return row["n"] if row else 0
+
+
+# ── Token purchase helpers ────────────────────────────────────────────────────
+
+def save_token_purchase(
+    address: str, token_mint: str, slot: int,
+    block_time: int | None, fee: int | None, signature: str,
+    path: str = DB_PATH,
+):
+    """Record a token purchase for later temporal co-purchase matching."""
+    now = int(time.time())
+    with get_db(path) as db:
+        db.execute(
+            """INSERT OR IGNORE INTO token_purchases
+               (address, token_mint, slot, block_time, fee, signature, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (address, token_mint, slot, block_time, fee, signature, now),
+        )
+
+
+def get_token_co_buyers(
+    token_mint: str,
+    block_time: int,
+    window_seconds: int = 300,
+    path: str = DB_PATH,
+) -> list[dict]:
+    """
+    Return all recorded purchases of `token_mint` within ±window_seconds
+    of `block_time`, by any tracked wallet.
+    """
+    lo = block_time - window_seconds
+    hi = block_time + window_seconds
+    with get_db(path) as db:
+        rows = db.execute(
+            """SELECT address, token_mint, slot, block_time, fee, signature
+               FROM token_purchases
+               WHERE token_mint = ?
+                 AND block_time BETWEEN ? AND ?
+               ORDER BY ABS(block_time - ?) ASC""",
+            (token_mint, lo, hi, block_time),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_shared_token_purchases(
+    addr1: str, addr2: str,
+    window_seconds: int = 300,
+    path: str = DB_PATH,
+) -> int:
+    """
+    Count how many distinct tokens addr1 and addr2 have both purchased
+    within `window_seconds` of each other.  Used to boost confidence when
+    the same pair repeatedly buys the same tokens around the same time.
+    """
+    with get_db(path) as db:
+        row = db.execute(
+            """
+            SELECT COUNT(DISTINCT a.token_mint) as n
+            FROM token_purchases a
+            JOIN token_purchases b
+              ON  a.token_mint = b.token_mint
+              AND ABS(a.block_time - b.block_time) <= ?
+            WHERE a.address = ?
+              AND b.address = ?
+            """,
+            (window_seconds, addr1, addr2),
         ).fetchone()
         return row["n"] if row else 0
 
