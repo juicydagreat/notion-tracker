@@ -64,15 +64,16 @@ def init_db(path: str = DB_PATH):
             PRIMARY KEY (cluster_name, address)
         );
 
-        -- Every token purchase we observe for any tracked wallet.
-        -- Used for temporal co-purchase matching (same token, different block).
+        -- Every token interaction we observe for any tracked wallet.
+        -- direction: 'buy' | 'sell' | 'unknown'
         CREATE TABLE IF NOT EXISTS token_purchases (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            address     TEXT NOT NULL,        -- wallet that bought
-            token_mint  TEXT NOT NULL,        -- token mint address
+            address     TEXT NOT NULL,
+            token_mint  TEXT NOT NULL,
             slot        INTEGER NOT NULL,
             block_time  INTEGER,
-            fee         INTEGER,              -- lamports (for fee-pattern boost)
+            fee         INTEGER,
+            direction   TEXT NOT NULL DEFAULT 'unknown',
             signature   TEXT NOT NULL,
             fetched_at  INTEGER NOT NULL,
             UNIQUE (address, signature, token_mint)
@@ -82,7 +83,17 @@ def init_db(path: str = DB_PATH):
             ON token_purchases(token_mint, block_time);
         CREATE INDEX IF NOT EXISTS idx_tp_address
             ON token_purchases(address);
+        CREATE INDEX IF NOT EXISTS idx_tp_direction
+            ON token_purchases(direction, token_mint, block_time);
     """)
+    # Migration: add direction column to existing DBs that predate this schema
+    try:
+        con.execute(
+            "ALTER TABLE token_purchases ADD COLUMN direction TEXT NOT NULL DEFAULT 'unknown'"
+        )
+        con.commit()
+    except Exception:
+        pass  # column already exists
     con.commit()
     con.close()
 
@@ -254,16 +265,17 @@ def count_recent_txs(address: str, since_ts: int,
 def save_token_purchase(
     address: str, token_mint: str, slot: int,
     block_time: int | None, fee: int | None, signature: str,
+    direction: str = "unknown",
     path: str = DB_PATH,
 ):
-    """Record a token purchase for later co-purchase pattern matching."""
+    """Record a token interaction (buy or sell) for co-purchase / sell-cluster matching."""
     now = int(time.time())
     with get_db(path) as db:
         db.execute(
             """INSERT OR IGNORE INTO token_purchases
-               (address, token_mint, slot, block_time, fee, signature, fetched_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (address, token_mint, slot, block_time, fee, signature, now),
+               (address, token_mint, slot, block_time, fee, direction, signature, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (address, token_mint, slot, block_time, fee, direction, signature, now),
         )
 
 
@@ -336,6 +348,109 @@ def get_co_purchase_pairs(
             ORDER BY shared_tokens DESC, fee_matches DESC
             """,
             (min_shared,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── Coordinated sell helpers ──────────────────────────────────────────────────
+
+def get_coordinated_sell_partners(
+    token_mint: str,
+    block_time: int,
+    exclude_address: str,
+    window_seconds: int = 120,
+    path: str = DB_PATH,
+) -> list[dict]:
+    """
+    Find all wallets that sold `token_mint` within ±window_seconds of block_time.
+    This detects the 'select all → sell all' pattern.
+
+    Returns [{address, slot, block_time, fee, signature, time_diff_seconds}]
+    sorted by closeness in time (tightest first).
+    """
+    lo = block_time - window_seconds
+    hi = block_time + window_seconds
+    with get_db(path) as db:
+        rows = db.execute(
+            """
+            SELECT
+                address, slot, block_time, fee, signature,
+                ABS(block_time - ?) AS time_diff_seconds
+            FROM token_purchases
+            WHERE token_mint   = ?
+              AND direction    = 'sell'
+              AND block_time   BETWEEN ? AND ?
+              AND address     != ?
+            ORDER BY time_diff_seconds ASC
+            """,
+            (block_time, token_mint, lo, hi, exclude_address),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_coordinated_sells(
+    addr1: str,
+    addr2: str,
+    window_seconds: int = 120,
+    path: str = DB_PATH,
+) -> int:
+    """
+    Count how many distinct tokens addr1 and addr2 have BOTH sold within
+    window_seconds of each other.  A high count = very strong ownership signal.
+    """
+    with get_db(path) as db:
+        row = db.execute(
+            """
+            SELECT COUNT(DISTINCT a.token_mint) AS n
+            FROM token_purchases a
+            JOIN token_purchases b
+              ON  a.token_mint = b.token_mint
+              AND ABS(a.block_time - b.block_time) <= ?
+            WHERE a.address   = ?
+              AND b.address   = ?
+              AND a.direction = 'sell'
+              AND b.direction = 'sell'
+            """,
+            (window_seconds, addr1, addr2),
+        ).fetchone()
+        return row["n"] if row else 0
+
+
+def get_sell_cluster_pairs(
+    window_seconds: int = 120,
+    min_co_sells: int = 1,
+    path: str = DB_PATH,
+) -> list[dict]:
+    """
+    Find ALL wallet pairs that have sold the same token within window_seconds
+    of each other at least min_co_sells times.
+
+    Returns [{addr1, addr2, co_sell_count, token_mints, avg_time_diff_seconds}]
+    sorted by co_sell_count DESC, avg_time_diff ASC.
+    """
+    with get_db(path) as db:
+        rows = db.execute(
+            """
+            SELECT
+                a.address                           AS addr1,
+                b.address                           AS addr2,
+                COUNT(DISTINCT a.token_mint)        AS co_sell_count,
+                GROUP_CONCAT(DISTINCT a.token_mint) AS token_mints,
+                AVG(ABS(a.block_time - b.block_time)) AS avg_time_diff_seconds,
+                SUM(CASE WHEN a.fee = b.fee
+                         AND a.fee IS NOT NULL THEN 1 ELSE 0 END) AS fee_matches
+            FROM token_purchases a
+            JOIN token_purchases b
+              ON  a.token_mint = b.token_mint
+              AND a.direction  = 'sell'
+              AND b.direction  = 'sell'
+              AND ABS(a.block_time - b.block_time) <= ?
+              AND a.address    < b.address
+            GROUP BY a.address, b.address
+            HAVING co_sell_count >= ?
+            ORDER BY co_sell_count DESC, avg_time_diff_seconds ASC
+            """,
+            (window_seconds, min_co_sells),
         ).fetchall()
         return [dict(r) for r in rows]
 

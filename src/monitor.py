@@ -27,14 +27,14 @@ from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Optional
 
 from src.config import DEFAULT_FEE_LAMPORTS, MAX_CREDITS_PER_RUN
-from src.helius import HeliusClient, BlockTx, extract_token_mints
+from src.helius import HeliusClient, BlockTx, extract_token_actions
 from src.db import (
     cache_signatures, cache_tx, get_cached_tx,
     get_last_signature, is_slot_scanned, mark_slot_scanned,
     save_candidate, save_token_purchase,
 )
 from src.wallets import WalletRegistry
-from src.matcher import MatchResult, _fee_confidence, co_purchase_pattern_scan
+from src.matcher import MatchResult, _fee_confidence, co_purchase_pattern_scan, coordinated_sell_scan
 
 
 # ── Solana system / infrastructure program addresses ─────────────────────────
@@ -88,7 +88,20 @@ class NewTxEvent:
     slot: int
     fee: Optional[int] = None
     block_time: Optional[int] = None
-    token_mints: list[str] = field(default_factory=list)
+    # {mint: 'buy'|'sell'} — populated from preTokenBalances/postTokenBalances
+    token_actions: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def token_mints(self) -> list[str]:
+        return list(self.token_actions.keys())
+
+    @property
+    def sells(self) -> list[str]:
+        return [m for m, d in self.token_actions.items() if d == "sell"]
+
+    @property
+    def buys(self) -> list[str]:
+        return [m for m, d in self.token_actions.items() if d == "buy"]
 
 
 # Type alias for the candidate callback
@@ -213,12 +226,30 @@ class WalletMonitor:
             entry.next_poll = time.monotonic() + interval
             heapq.heappush(self._heap, entry)
 
-            # Queue block scans for unique-fee new txs
+            # Queue block scans for unique-fee new txs; run sell-cluster scans inline
+            sell_candidates: list[MatchResult] = []
             for evt in new_txs:
+                # Same-block fee scan (Helius, deferred)
                 if evt.fee and evt.fee > self.cfg.min_fee_for_scan:
                     self._pending_slots[evt.slot].append(
                         (evt.address, evt.fee, evt.signature)
                     )
+
+                # Coordinated sell scan (DB-only, 0 credits, immediate)
+                if evt.sells and evt.block_time:
+                    for mint in evt.sells:
+                        hits = coordinated_sell_scan(
+                            wallet_address=evt.address,
+                            token_mint=mint,
+                            block_time=evt.block_time,
+                            fee=evt.fee,
+                            registry=self.registry,
+                        )
+                        sell_candidates.extend(hits)
+
+            if sell_candidates and self.on_candidate:
+                self.stats["candidates"] += len(sell_candidates)
+                await self.on_candidate(entry.address, sell_candidates)
 
             # Periodic co-purchase pattern sweep (pure DB, 0 credits)
             # Runs every co_purchase_sweep_interval seconds, not every poll.
@@ -295,19 +326,18 @@ class WalletMonitor:
 
         # Fetch full tx data for each new non-error tx.
         # Via free public RPC → 0 Helius credits.
-        # Extracts both fee (for block scan) and token mints (for temporal scan).
+        # Extracts fee (for block scan) + buy/sell actions (for sell-cluster and co-purchase).
         events = []
         for s in new:
             if s.err:
                 continue
 
             fee: Optional[int] = None
-            mints: list[str] = []
+            actions: dict[str, str] = {}
 
             cached = get_cached_tx(s.signature)
             if cached and cached.get("fee") is not None:
                 fee = cached["fee"]
-                # Mints not stored in tx_cache — fetch full tx below
 
             # Fetch the full transaction (free RPC, 0 credits)
             try:
@@ -319,7 +349,6 @@ class WalletMonitor:
                 meta = tx_data.get("meta") or {}
                 if fee is None:
                     fee = meta.get("fee")
-                    # Extract fee_payer and cache
                     accounts = (
                         tx_data.get("transaction", {})
                         .get("message", {})
@@ -337,14 +366,15 @@ class WalletMonitor:
                         cache_tx(s.signature, s.slot, fee, fee_payer or address,
                                  s.block_time)
 
-                # Extract token mints (free — already have the tx data)
-                mints = extract_token_mints(tx_data)
+                # Extract buy/sell direction for each token (free — tx already fetched)
+                actions = extract_token_actions(tx_data, address)
 
-                # Save each token purchase for temporal cross-matching
-                if mints and s.block_time:
-                    for mint in mints:
+                # Save all token interactions with their direction
+                if actions and s.block_time:
+                    for mint, direction in actions.items():
                         save_token_purchase(
-                            address, mint, s.slot, s.block_time, fee, s.signature
+                            address, mint, s.slot, s.block_time,
+                            fee, s.signature, direction=direction,
                         )
 
             events.append(NewTxEvent(
@@ -353,7 +383,7 @@ class WalletMonitor:
                 slot=s.slot,
                 fee=fee,
                 block_time=s.block_time,
-                token_mints=mints,
+                token_actions=actions,
             ))
 
         return events

@@ -293,3 +293,58 @@ def extract_token_mints(tx_data: dict) -> list[str]:
                 mints.add(mint)
 
     return list(mints)
+
+
+def extract_token_actions(tx_data: dict, fee_payer: str) -> dict[str, str]:
+    """
+    Determine whether the fee_payer bought or sold each token in a transaction.
+
+    Uses `meta.preTokenBalances` / `meta.postTokenBalances` with the `owner`
+    field to find the fee_payer's token balance changes:
+      post > pre  → 'buy'   (received tokens)
+      post < pre  → 'sell'  (sent tokens)
+      post == 0, not in pre → 'sell' (closed ATA — sold everything)
+
+    Returns {mint_address: 'buy' | 'sell'}
+    Only includes mints where a meaningful balance change occurred.
+    """
+    if not tx_data or not fee_payer:
+        return {}
+
+    meta = tx_data.get("meta") or {}
+    pre_balances: dict[str, int] = {}
+    post_balances: dict[str, int] = {}
+
+    for entry in meta.get("preTokenBalances") or []:
+        if entry.get("owner") == fee_payer:
+            mint = entry.get("mint")
+            amt = entry.get("uiTokenAmount", {}).get("amount", "0")
+            if mint and mint not in _EXCLUDED_MINTS:
+                try:
+                    pre_balances[mint] = int(amt)
+                except (ValueError, TypeError):
+                    pass
+
+    for entry in meta.get("postTokenBalances") or []:
+        if entry.get("owner") == fee_payer:
+            mint = entry.get("mint")
+            amt = entry.get("uiTokenAmount", {}).get("amount", "0")
+            if mint and mint not in _EXCLUDED_MINTS:
+                try:
+                    post_balances[mint] = int(amt)
+                except (ValueError, TypeError):
+                    pass
+
+    actions: dict[str, str] = {}
+    all_mints = set(pre_balances) | set(post_balances)
+
+    for mint in all_mints:
+        pre = pre_balances.get(mint, 0)
+        post = post_balances.get(mint, 0)
+        if post > pre:
+            actions[mint] = "buy"
+        elif post < pre:
+            actions[mint] = "sell"
+        # No change → skip (e.g. token account involved but balance unchanged)
+
+    return actions

@@ -11,6 +11,7 @@ Commands:
   refresh <name>         Re-fetch transaction data for a named cluster
   export <name> [addrs]  Export cluster as importable JSON with UPPER/lower naming
   co-purchase [N]        Show wallet pairs with N+ tokens bought in common (default 3)
+  sell-clusters [window] Show wallets that sell same tokens together (default 120s window)
 """
 import asyncio
 import json
@@ -35,7 +36,7 @@ from src.matcher import (
     funding_trace,
     co_purchase_pattern_scan,
 )
-from src.db import get_co_purchase_pairs
+from src.db import get_co_purchase_pairs, get_sell_cluster_pairs
 from src.output import export_cluster, write_export, merge_into_wallets_json
 from src.twitter import search_url as twitter_search_url
 from src.gmgn import wallet_page_url as gmgn_page_url
@@ -428,6 +429,91 @@ def cmd_co_purchase(registry: WalletRegistry, min_shared: int = 3):
     )
 
 
+def cmd_sell_clusters(registry: WalletRegistry, window_seconds: int = 120):
+    """
+    Show wallet pairs that have sold the same token within window_seconds of each other.
+
+    This detects the 'select all wallets → sell all' pattern — one of the strongest
+    indicators of shared wallet ownership. When a trader controls multiple wallets,
+    they typically trigger a simultaneous sell on all of them.
+
+    High average time diff (e.g. 90s) = possibly sequential manual sells.
+    Low average time diff (e.g. 3s)   = near-simultaneous = almost certainly same person.
+    """
+    pairs = get_sell_cluster_pairs(window_seconds=window_seconds, min_co_sells=1)
+    if not pairs:
+        console.print(
+            f"[yellow]No sell clusters found (window: {window_seconds}s).[/yellow]\n"
+            "[dim]Run the daemon to accumulate sell data, then re-run.[/dim]"
+        )
+        return
+
+    t = Table(
+        title=f"Coordinated Sell Clusters (window: {window_seconds}s)",
+        box=box.ROUNDED,
+        show_lines=True,
+    )
+    t.add_column("Wallet A", style="cyan")
+    t.add_column("Wallet B", style="cyan")
+    t.add_column("Co-Sells", justify="right", style="bold")
+    t.add_column("Avg Δt", justify="right")
+    t.add_column("Fee\nMatches", justify="right")
+    t.add_column("Confidence", justify="right")
+    t.add_column("Tokens Sold Together", style="dim")
+
+    for pair in pairs:
+        co_sells = pair["co_sell_count"]
+        avg_dt = pair.get("avg_time_diff_seconds") or window_seconds
+        fee_hits = pair["fee_matches"] or 0
+
+        # Confidence: base 0.70 + tightness of timing + fee + repeat pattern
+        conf = 0.70
+        if avg_dt <= 10:
+            conf += 0.15
+        elif avg_dt <= 30:
+            conf += 0.08
+        if fee_hits > 0:
+            conf += 0.05
+        extra = max(co_sells - 1, 0)
+        conf = min(conf + extra * 0.08, 0.97)
+        conf_color = "green" if conf >= 0.80 else "yellow"
+
+        a_wallet = registry.get(pair["addr1"])
+        b_wallet = registry.get(pair["addr2"])
+        a_label = a_wallet.label if a_wallet else pair["addr1"][:16] + "…"
+        b_label = b_wallet.label if b_wallet else pair["addr2"][:16] + "…"
+
+        mints = (pair["token_mints"] or "").split(",")
+        sample = ", ".join(m[:8] + "…" for m in mints[:3])
+        if len(mints) > 3:
+            sample += f" +{len(mints) - 3}"
+
+        t.add_row(
+            a_label,
+            b_label,
+            str(co_sells),
+            f"{avg_dt:.0f}s",
+            str(fee_hits),
+            f"[{conf_color}]{conf:.0%}[/{conf_color}]",
+            sample,
+        )
+
+    console.print(t)
+
+    # Highlight near-simultaneous pairs (strongest signal)
+    hot = [p for p in pairs if (p.get("avg_time_diff_seconds") or 999) <= 10]
+    if hot:
+        console.print(
+            f"\n[green bold]⚡ {len(hot)} pair(s) sold within 10s of each other "
+            f"— near-certain 'sell all' signal[/green bold]"
+        )
+
+    console.print(
+        f"\n[dim]{len(pairs)} pairs. "
+        f"Use [bold]python discover.py export <name>[/bold] to produce importable JSON.[/dim]"
+    )
+
+
 def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
     """Show all saved match candidates from DB."""
     candidates = get_candidates(min_confidence=min_conf)
@@ -520,6 +606,12 @@ async def main():
         init_db()
         min_shared = int(args[1]) if len(args) > 1 else 3
         cmd_co_purchase(registry, min_shared)
+
+    elif cmd == "sell-clusters":
+        registry = WalletRegistry()
+        init_db()
+        window = int(args[1]) if len(args) > 1 else 120
+        cmd_sell_clusters(registry, window)
 
     elif cmd == "export":
         if len(args) < 2:

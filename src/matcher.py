@@ -17,6 +17,7 @@ from src.db import (
     get_wallet_slots, get_slots_multi, save_candidate,
     get_token_buyers, count_shared_token_purchases,
     get_co_purchase_pairs,
+    get_coordinated_sell_partners, count_coordinated_sells,
 )
 from src.wallets import WalletRegistry
 
@@ -320,5 +321,94 @@ def co_purchase_pattern_scan(
                 known_label=w.label if w else None,
             ))
             save_candidate(candidate, trigger, "co_purchase_pattern", conf, evidence)
+
+    return sorted(results, key=lambda r: -r.confidence)
+
+
+def coordinated_sell_scan(
+    wallet_address: str,
+    token_mint: str,
+    block_time: int,
+    fee: Optional[int],
+    registry: WalletRegistry,
+    window_seconds: int = 120,
+) -> list[MatchResult]:
+    """
+    Detect the 'select all wallets → sell all' pattern.
+
+    When a trader uses multiple wallets, they typically select all of them
+    in their interface and sell simultaneously. This creates a tight cluster
+    of sell transactions for the same token within seconds of each other —
+    one of the strongest indicators of shared wallet ownership.
+
+    Confidence scoring:
+      0.70  base  (sold same token within window — strong signal)
+      +0.15 within 10 seconds  (near-simultaneous = almost certainly 'sell all')
+      +0.08 within 30 seconds
+      +0.05 same fee fingerprint
+      +0.08 per additional co-sell token (pattern seen before, max +0.16)
+      max   0.97
+
+    Unlike co-purchase pattern, timing IS a factor here because the 'sell all'
+    action broadcasts all transactions at once.
+    """
+    partners = get_coordinated_sell_partners(
+        token_mint, block_time, wallet_address, window_seconds
+    )
+    results: list[MatchResult] = []
+
+    for record in partners:
+        candidate = record["address"]
+        time_diff = record.get("time_diff_seconds") or window_seconds
+        candidate_fee = record.get("fee")
+
+        conf = 0.70  # base: sold same token within window
+
+        # Tighter timing = stronger signal
+        if time_diff <= 10:
+            conf += 0.15   # near-simultaneous = almost certainly 'sell all'
+        elif time_diff <= 30:
+            conf += 0.08   # within a couple of blocks
+
+        # Fee fingerprint match
+        if fee is not None and candidate_fee == fee:
+            conf += 0.05
+
+        # Repeated pattern boost: have they sold together before?
+        prior_co_sells = count_coordinated_sells(
+            wallet_address, candidate, window_seconds
+        )
+        # prior_co_sells includes the current one, so extra = prior - 1
+        extra = max(prior_co_sells - 1, 0)
+        conf += min(extra * 0.08, 0.16)
+
+        conf = min(round(conf, 2), 0.97)
+
+        w = registry.get(candidate)
+        evidence = {
+            "token_mint": token_mint,
+            "trigger_address": wallet_address,
+            "trigger_block_time": block_time,
+            "candidate_block_time": record.get("block_time"),
+            "time_diff_seconds": time_diff,
+            "fee_match": fee is not None and candidate_fee == fee,
+            "trigger_fee": fee,
+            "candidate_fee": candidate_fee,
+            "prior_co_sells": prior_co_sells,
+            "candidate_sig": record.get("signature"),
+            "match_basis": "coordinated_sell",
+        }
+
+        results.append(MatchResult(
+            address=candidate,
+            match_type="coordinated_sell",
+            confidence=conf,
+            evidence=evidence,
+            known_label=w.label if w else None,
+        ))
+        save_candidate(
+            candidate, wallet_address,
+            "coordinated_sell", conf, evidence,
+        )
 
     return sorted(results, key=lambda r: -r.confidence)
