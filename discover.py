@@ -14,6 +14,12 @@ Commands:
   sell-clusters [window] Show wallets that sell same tokens together (default 10s window)
   dune-scan              Fetch Dune historical results and import into candidates DB
   dune-setup             Print Dune query setup instructions
+
+Copy Bot Analysis (requires daemon to have populated token_purchases, or Dune):
+  bot-leads <bot>        Find wallets a copy bot is copying (local DB + live API)
+  investigate <t1> [t2…] [--bot <bot>] [--max-lag N]
+                         Find who bought these tokens before a known bot
+  dune-bot-leads <bot>   Full 30-day bot-lead analysis via Dune Analytics
 """
 import asyncio
 import json
@@ -26,7 +32,10 @@ from rich.panel import Panel
 from rich import box
 from rich.text import Text
 
-from src.config import HELIUS_API_KEY, DB_PATH, DUNE_API_KEY, DUNE_SELL_QUERY_ID, DUNE_COPURCHASE_QUERY_ID
+from src.config import (
+    HELIUS_API_KEY, DB_PATH,
+    DUNE_API_KEY, DUNE_SELL_QUERY_ID, DUNE_COPURCHASE_QUERY_ID, DUNE_BOT_LEADS_QUERY_ID,
+)
 from src.db import init_db, get_candidates
 from src.wallets import WalletRegistry
 from src.analysis import summary, cluster_by_group
@@ -628,6 +637,288 @@ def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
                   f"Untracked = potential new wallet to add.[/dim]")
 
 
+async def cmd_bot_leads(
+    bot_wallet: str,
+    registry: WalletRegistry,
+    lookback: int = 100,
+    max_lag: int = 60,
+):
+    """
+    Find the wallets a copy bot is systematically copying.
+
+    Works by fetching the bot's recent buy history via free RPC, then querying
+    the local token_purchases DB for who bought each token before the bot.
+
+    Best results when the daemon has been running so token_purchases is populated.
+    For a fresh install without daemon data, use `dune-bot-leads` instead.
+    """
+    from src.bot_tracker import find_bot_leads
+
+    console.print(f"\n[cyan]Analyzing copy bot:[/cyan] {bot_wallet}")
+    console.print(f"[dim]Lookback: {lookback} txs  |  Max lag: {max_lag}s[/dim]\n")
+
+    client = HeliusClient()
+    try:
+        with console.status("[dim]Fetching bot transaction history…[/dim]"):
+            results = await find_bot_leads(
+                bot_wallet, client, registry,
+                lookback=lookback, max_lag=max_lag,
+            )
+
+        if not results:
+            console.print(
+                "[yellow]No leads found.[/yellow]\n"
+                "[dim]This requires token_purchases data in the local DB.\n"
+                "  • Run the daemon first:   python daemon.py\n"
+                "  • Or use Dune (30-day history):   "
+                "python discover.py dune-bot-leads " + bot_wallet + "[/dim]"
+            )
+            console.print(f"[dim]Credits used: {client.credits_used}[/dim]")
+            return
+
+        t = Table(
+            title=f"Copy Bot Lead Analysis — {bot_wallet[:16]}…",
+            box=box.ROUNDED,
+            show_lines=True,
+        )
+        t.add_column("Lead Wallet", style="cyan")
+        t.add_column("Tokens\nLed", justify="right", style="bold")
+        t.add_column("Avg Lag", justify="right")
+        t.add_column("Min Lag", justify="right")
+        t.add_column("Confidence", justify="right")
+        t.add_column("Known As")
+        t.add_column("Sample Tokens", style="dim")
+
+        for r in results[:25]:
+            conf_color = "green" if r.confidence >= 0.80 else "yellow" if r.confidence >= 0.60 else "dim"
+            lag_color = "green" if r.avg_lag_seconds <= 5 else "yellow" if r.avg_lag_seconds <= 20 else "white"
+            sample = ", ".join(m[:8] + "…" for m in r.token_mints[:3])
+            if len(r.token_mints) > 3:
+                sample += f" +{len(r.token_mints) - 3}"
+            t.add_row(
+                r.wallet,
+                str(r.tokens_led),
+                f"[{lag_color}]{r.avg_lag_seconds:.1f}s[/{lag_color}]",
+                f"{r.min_lag_seconds:.0f}s",
+                f"[{conf_color}]{r.confidence:.0%}[/{conf_color}]",
+                r.known_label or "[dim]untracked[/dim]",
+                sample,
+            )
+        console.print(t)
+
+        top = [r for r in results if r.tokens_led >= 2][:3]
+        if top:
+            console.print(
+                f"\n[bold]Top lead(s):[/bold] " +
+                ", ".join(r.wallet[:12] + "…" for r in top)
+            )
+            console.print(
+                "[dim]Cross-reference with co-purchase / sell-cluster data to confirm.[/dim]"
+            )
+        console.print(f"[dim]Credits used: {client.credits_used}[/dim]")
+    finally:
+        await client.close()
+
+
+async def cmd_investigate(
+    token_mints: list[str],
+    registry: WalletRegistry,
+    bot_wallet: str = "",
+    max_lag: int = 60,
+):
+    """
+    Given token mints (tokens a target trader bought), find wallets that
+    bought those same tokens — and optionally bought them BEFORE a known bot.
+
+    This is the direct training-data workflow:
+      python discover.py investigate <token1> <token2> <token3> --bot <bot_wallet>
+    """
+    from src.bot_tracker import investigate_tokens
+    import datetime
+
+    console.print(f"\n[cyan]Investigating {len(token_mints)} token(s):[/cyan]")
+    for m in token_mints:
+        console.print(f"  [dim]{m}[/dim]")
+    if bot_wallet:
+        console.print(f"\n[cyan]Bot wallet:[/cyan] {bot_wallet}")
+        console.print(f"[dim]Max lag window: {max_lag}s[/dim]")
+
+    client = HeliusClient()
+    try:
+        with console.status("[dim]Analyzing token buy patterns…[/dim]"):
+            result = await investigate_tokens(
+                token_mints, client, registry,
+                bot_wallet=bot_wallet or None,
+                max_lag=max_lag,
+            )
+
+        # Bot buy reference times
+        if result["bot_buys"]:
+            console.print("\n[bold]Bot buy times (reference points):[/bold]")
+            for mint, buy in result["bot_buys"].items():
+                ts = datetime.datetime.utcfromtimestamp(buy.bot_block_time).strftime("%Y-%m-%d %H:%M:%S")
+                console.print(
+                    f"  {mint[:20]}…  [dim]{ts} UTC  slot {buy.bot_slot}[/dim]  "
+                    f"[link]sig: {buy.bot_signature[:16]}…[/link]"
+                )
+            missing = [m for m in token_mints if m not in result["bot_buys"]]
+            if missing:
+                console.print(
+                    f"  [yellow]Bot buy not found for {len(missing)} token(s) "
+                    f"in last 200 txs — it may have traded earlier.[/yellow]"
+                )
+
+        # Intersection highlight
+        intersection = result["intersection"]
+        if intersection:
+            label = "bought ALL tokens before the bot" if bot_wallet else "bought ALL tokens"
+            console.print(
+                f"\n[bold green]⚡ {len(intersection)} wallet(s) {label}:[/bold green]"
+            )
+            for w in intersection[:10]:
+                winfo = registry.get(w)
+                label_str = winfo.label if winfo else "[dim]untracked[/dim]"
+                console.print(f"  [green bold]{w}[/green bold]  {label_str}")
+        elif token_mints:
+            console.print(
+                f"\n[yellow]No single wallet appeared in all {len(token_mints)} tokens.[/yellow]"
+            )
+
+        # Full ranked table
+        ranked = result["ranked"]
+        if ranked:
+            title = "Token Buy Pattern — Ranked Candidates"
+            t = Table(title=title, box=box.ROUNDED, show_lines=True)
+            t.add_column("Wallet", style="cyan")
+            t.add_column("Tokens\nMatched", justify="right", style="bold")
+            if bot_wallet:
+                t.add_column("Avg Lag\n(before bot)", justify="right")
+            t.add_column("Confidence", justify="right")
+            t.add_column("Known As")
+
+            for r in ranked[:20]:
+                conf_color = "green" if r.confidence >= 0.80 else "yellow" if r.confidence >= 0.50 else "dim"
+                row_data: list = [r.wallet, str(r.tokens_led)]
+                if bot_wallet:
+                    lag_color = "green" if r.avg_lag_seconds <= 5 else "yellow"
+                    row_data.append(f"[{lag_color}]{r.avg_lag_seconds:.1f}s[/{lag_color}]")
+                row_data.extend([
+                    f"[{conf_color}]{r.confidence:.0%}[/{conf_color}]",
+                    r.known_label or "[dim]untracked[/dim]",
+                ])
+                t.add_row(*row_data)
+            console.print(t)
+        else:
+            console.print(
+                "\n[yellow]No token purchase data found in local DB.[/yellow]\n"
+                "[dim]The daemon must run to populate buy history.\n"
+                "For immediate results run: python discover.py dune-bot-leads " +
+                (bot_wallet or "<bot_wallet>") + "[/dim]"
+            )
+
+        console.print(f"\n[dim]Credits used: {client.credits_used}[/dim]")
+    finally:
+        await client.close()
+
+
+async def cmd_dune_bot_leads(
+    bot_wallet: str,
+    registry: WalletRegistry,
+    max_lag: int = 60,
+):
+    """
+    Full 30-day bot-lead analysis via Dune Analytics.
+
+    Runs the BOT_LEADS_QUERY against dex_solana.trades to find every wallet
+    that bought a token 0-max_lag seconds before the bot over the past 30 days.
+    Costs ~10-50 Dune execution credits per run.
+
+    Requires DUNE_API_KEY and DUNE_BOT_LEADS_QUERY_ID in .env.
+    Run `python discover.py dune-setup` for setup instructions.
+    """
+    from src.dune import DuneClient, import_bot_leads
+
+    if not DUNE_API_KEY:
+        console.print(
+            "[red]DUNE_API_KEY not set.[/red] "
+            "Run [bold]python discover.py dune-setup[/bold] for instructions."
+        )
+        return
+
+    if not DUNE_BOT_LEADS_QUERY_ID:
+        console.print(
+            "[red]DUNE_BOT_LEADS_QUERY_ID not set.[/red]\n"
+            "Create the BOT_LEADS_QUERY on dune.com (SQL in src/dune.py), "
+            "then add DUNE_BOT_LEADS_QUERY_ID=<id> to your .env.\n"
+            "Run [bold]python discover.py dune-setup[/bold] for detailed instructions."
+        )
+        return
+
+    console.print(f"\n[cyan]Running Dune bot-lead analysis for:[/cyan] {bot_wallet}")
+    console.print(f"[dim]Max lag: {max_lag}s  |  Query ID: {DUNE_BOT_LEADS_QUERY_ID}[/dim]")
+    console.print("[dim]Executing query (costs ~10-50 Dune credits)…[/dim]\n")
+
+    client = DuneClient(DUNE_API_KEY)
+    try:
+        with console.status("[dim]Running Dune query…[/dim]"):
+            rows = await client.run_bot_leads_scan(
+                DUNE_BOT_LEADS_QUERY_ID,
+                bot_wallet=bot_wallet,
+                max_lag=max_lag,
+                use_cache=False,
+            )
+
+        if not rows:
+            console.print("[yellow]No leads found in Dune results.[/yellow]")
+            return
+
+        n = import_bot_leads(rows, bot_wallet)
+        console.print(f"[green]✓[/green] {len(rows)} lead wallets found → {n} candidates saved\n")
+
+        t = Table(
+            title=f"Dune Bot Lead Analysis — {bot_wallet[:16]}… (30-day history)",
+            box=box.ROUNDED,
+            show_lines=True,
+        )
+        t.add_column("Lead Wallet", style="cyan")
+        t.add_column("Tokens\nLed", justify="right", style="bold")
+        t.add_column("Avg Lag", justify="right")
+        t.add_column("Min Lag", justify="right")
+        t.add_column("Confidence", justify="right")
+        t.add_column("Known As")
+
+        for row in rows[:25]:
+            lead = row.get("lead_wallet", "")
+            tokens_led = int(row.get("tokens_led", 0))
+            avg_lag = float(row.get("avg_lag_seconds") or 60)
+            min_lag = float(row.get("min_lag_seconds") or 60)
+
+            from src.bot_tracker import _confidence
+            conf = _confidence(tokens_led, avg_lag)
+            conf_color = "green" if conf >= 0.80 else "yellow" if conf >= 0.60 else "dim"
+            lag_color = "green" if avg_lag <= 5 else "yellow" if avg_lag <= 20 else "white"
+
+            w = registry.get(lead)
+            t.add_row(
+                lead,
+                str(tokens_led),
+                f"[{lag_color}]{avg_lag:.1f}s[/{lag_color}]",
+                f"{min_lag:.0f}s",
+                f"[{conf_color}]{conf:.0%}[/{conf_color}]",
+                w.label if w else "[dim]untracked[/dim]",
+            )
+        console.print(t)
+
+        top = sorted(rows, key=lambda r: (-int(r.get("tokens_led", 0)), float(r.get("avg_lag_seconds") or 60)))[:3]
+        if top:
+            console.print(
+                f"\n[bold]Top lead(s):[/bold] " +
+                ", ".join(r.get("lead_wallet", "?")[:12] + "…" for r in top)
+            )
+    finally:
+        await client.close()
+
+
 async def main():
     args = sys.argv[1:]
     if not args:
@@ -705,6 +996,67 @@ async def main():
     elif cmd == "dune-setup":
         from src.dune import print_query_setup_guide
         print_query_setup_guide()
+
+    elif cmd == "bot-leads":
+        if len(args) < 2:
+            console.print("[red]Usage:[/red] python discover.py bot-leads <bot_wallet> [--lookback N] [--max-lag N]")
+            return
+        check_setup()
+        registry = WalletRegistry()
+        init_db()
+        bot_wallet = args[1]
+        lookback = 100
+        max_lag = 60
+        i = 2
+        while i < len(args):
+            if args[i] == "--lookback" and i + 1 < len(args):
+                lookback = int(args[i + 1]); i += 1
+            elif args[i] == "--max-lag" and i + 1 < len(args):
+                max_lag = int(args[i + 1]); i += 1
+            i += 1
+        await cmd_bot_leads(bot_wallet, registry, lookback=lookback, max_lag=max_lag)
+
+    elif cmd == "investigate":
+        if len(args) < 2:
+            console.print(
+                "[red]Usage:[/red] python discover.py investigate <token1> [token2 …] "
+                "[--bot <bot_wallet>] [--max-lag N]"
+            )
+            return
+        check_setup()
+        registry = WalletRegistry()
+        init_db()
+        token_mints = []
+        bot_wallet = ""
+        max_lag = 60
+        i = 1
+        while i < len(args):
+            if args[i] == "--bot" and i + 1 < len(args):
+                bot_wallet = args[i + 1]; i += 1
+            elif args[i] == "--max-lag" and i + 1 < len(args):
+                max_lag = int(args[i + 1]); i += 1
+            elif not args[i].startswith("--"):
+                token_mints.append(args[i])
+            i += 1
+        if not token_mints:
+            console.print("[red]Error:[/red] At least one token mint address required.")
+            return
+        await cmd_investigate(token_mints, registry, bot_wallet=bot_wallet, max_lag=max_lag)
+
+    elif cmd == "dune-bot-leads":
+        if len(args) < 2:
+            console.print("[red]Usage:[/red] python discover.py dune-bot-leads <bot_wallet> [--max-lag N]")
+            return
+        registry = WalletRegistry()
+        init_db()
+        bot_wallet = args[1]
+        max_lag = 60
+        i = 2
+        while i < len(args):
+            if args[i] == "--max-lag" and i + 1 < len(args):
+                max_lag = int(args[i + 1]); i += 1
+            i += 1
+        await cmd_dune_bot_leads(bot_wallet, registry, max_lag=max_lag)
 
     elif cmd == "export":
         if len(args) < 2:

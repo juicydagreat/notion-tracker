@@ -80,6 +80,63 @@ HAVING count(DISTINCT a.mint) >= 1
 ORDER BY avg_time_diff_seconds ASC, co_sell_count DESC
 """
 
+BOT_LEADS_QUERY = """
+-- Copy Bot Lead Analysis
+-- For a known copy bot, find wallets that consistently bought the same tokens
+-- BEFORE the bot did.  Those wallets are the ones it is copying.
+--
+-- Parameters:
+--   {{bot_wallet}}  TEXT   — the bot's Solana address
+--   {{max_lag}}     INT    — max seconds between lead buy and bot buy (default 60)
+--
+-- Returns one row per lead wallet, ranked by tokens_led DESC, avg_lag ASC.
+-- A wallet appearing on 3+ tokens with avg_lag < 10s is almost certainly a source.
+WITH bot_buys AS (
+    SELECT
+        token_bought_mint_address   AS mint,
+        block_time                  AS bot_time,
+        tx_id                       AS bot_sig
+    FROM dex_solana.trades
+    WHERE trader_a = '{{bot_wallet}}'
+      AND token_bought_mint_address NOT IN (
+          'So11111111111111111111111111111111111111112',
+          'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+          'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+          '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs'
+      )
+      AND block_time >= now() - interval '30' day
+),
+leads AS (
+    SELECT
+        t.trader_a                                          AS lead_wallet,
+        t.token_bought_mint_address                         AS mint,
+        t.block_time                                        AS lead_time,
+        b.bot_time,
+        date_diff('second', t.block_time, b.bot_time)       AS lag_seconds
+    FROM dex_solana.trades t
+    JOIN bot_buys b ON t.token_bought_mint_address = b.mint
+    WHERE t.trader_a != '{{bot_wallet}}'
+      AND date_diff('second', t.block_time, b.bot_time) BETWEEN 0 AND {{max_lag}}
+      AND t.token_bought_mint_address NOT IN (
+          'So11111111111111111111111111111111111111112',
+          'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+          'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+          '7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs'
+      )
+)
+SELECT
+    lead_wallet,
+    COUNT(DISTINCT mint)                AS tokens_led,
+    CAST(AVG(lag_seconds) AS DOUBLE)    AS avg_lag_seconds,
+    MIN(lag_seconds)                    AS min_lag_seconds,
+    MAX(lag_seconds)                    AS max_lag_seconds,
+    array_agg(DISTINCT mint)            AS token_mints
+FROM leads
+GROUP BY lead_wallet
+HAVING COUNT(DISTINCT mint) >= 1
+ORDER BY tokens_led DESC, avg_lag_seconds ASC
+"""
+
 CO_PURCHASE_QUERY = """
 -- Co-Purchase Pattern Detection
 -- Finds wallet pairs that have bought the same tokens at any point in time.
@@ -257,6 +314,33 @@ class DuneClient:
             rows = await self.wait_for_results(eid)
         return rows
 
+    async def run_bot_leads_scan(
+        self,
+        query_id: int,
+        bot_wallet: str,
+        max_lag: int = 60,
+        use_cache: bool = False,
+    ) -> list[dict]:
+        """
+        Run the bot-leads query for a specific bot wallet.
+
+        Unlike the sell/co-purchase queries, this is bot-specific so cache is
+        less useful — set use_cache=True only if you have a scheduled query
+        already parameterised for this bot.
+
+        Returns rows: {lead_wallet, tokens_led, avg_lag_seconds, min_lag_seconds,
+                       max_lag_seconds, token_mints}
+        """
+        if use_cache:
+            rows = await self.fetch_latest_results(query_id)
+        else:
+            eid = await self.execute_query(query_id, {
+                "bot_wallet": bot_wallet,
+                "max_lag": max_lag,
+            })
+            rows = await self.wait_for_results(eid)
+        return rows
+
 
 # ── Result importers — save Dune findings into local DB ─────────────────────
 
@@ -334,6 +418,54 @@ def import_co_purchases(rows: list[dict], registry, path: str = DB_PATH) -> int:
     return count
 
 
+def import_bot_leads(rows: list[dict], bot_wallet: str, path: str = DB_PATH) -> int:
+    """
+    Save Dune bot-leads results into both bot_leads and candidates tables.
+    Returns number of lead wallet records saved.
+    """
+    from src.db import save_bot_lead
+    from src.bot_tracker import _confidence  # reuse confidence formula
+
+    count = 0
+    for row in rows:
+        lead_wallet = row.get("lead_wallet", "")
+        if not lead_wallet:
+            continue
+
+        tokens_led = int(row.get("tokens_led", 0))
+        avg_lag = float(row.get("avg_lag_seconds") or 60)
+        min_lag = int(row.get("min_lag_seconds") or 60)
+        mints = row.get("token_mints") or []
+        if isinstance(mints, str):
+            mints = mints.split(",")
+
+        # Save a synthetic bot_leads entry (no per-token detail from Dune)
+        for mint in mints[:10]:
+            save_bot_lead(
+                bot_wallet=bot_wallet,
+                lead_wallet=lead_wallet,
+                token_mint=mint,
+                lead_block_time=0,    # Dune rows lack exact block_time
+                bot_block_time=0,
+                lag_seconds=int(avg_lag),
+                path=path,
+            )
+
+        conf = _confidence(tokens_led, avg_lag)
+        evidence = {
+            "source": "dune_bot_lead",
+            "bot_wallet": bot_wallet,
+            "tokens_led": tokens_led,
+            "avg_lag_seconds": avg_lag,
+            "min_lag_seconds": min_lag,
+            "token_mints": mints[:10],
+        }
+        save_candidate(lead_wallet, bot_wallet, "bot_lead", conf, evidence, path)
+        count += 1
+
+    return count
+
+
 def print_query_setup_guide():
     """Print instructions for setting up Dune queries."""
     print("""
@@ -353,16 +485,26 @@ def print_query_setup_guide():
    - Add parameters:  wallets_csv (text), min_shared (number, default: 3)
    - Save and note the query ID
 
-4. Schedule both queries to run daily (Settings → Schedule → Daily)
+4. Create the BOT LEADS query (for copy-bot reverse engineering):
+   - Paste the SQL from BOT_LEADS_QUERY in src/dune.py
+   - Add parameters:  bot_wallet (text), max_lag (number, default: 60)
+   - Save and note the query ID
+   - This query is NOT scheduled (it's bot-specific); run on demand.
+
+5. Schedule sell + co-purchase queries to run daily (Settings → Schedule → Daily)
    Scheduled runs are FREE and don't cost execution credits.
 
-5. Add to your .env:
+6. Add to your .env:
    DUNE_API_KEY=your_api_key_here
    DUNE_SELL_QUERY_ID=123456
    DUNE_COPURCHASE_QUERY_ID=789012
+   DUNE_BOT_LEADS_QUERY_ID=345678   # optional
 
-6. Run daily sweep:
+7. Run daily sweep:
    python discover.py dune-scan
+
+8. Run bot-lead analysis via Dune (full 30-day history, costs ~10-50 credits):
+   python discover.py dune-bot-leads <bot_wallet_address>
 
 Free tier credit usage:
   - Fetching scheduled results = 0 credits

@@ -23,6 +23,7 @@ WALLETS_FILE = os.getenv("WALLETS_FILE", "wallets.json")
 DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 DUNE_SELL_QUERY_ID = int(os.getenv("DUNE_SELL_QUERY_ID", "0"))
 DUNE_COPURCHASE_QUERY_ID = int(os.getenv("DUNE_COPURCHASE_QUERY_ID", "0"))
+DUNE_BOT_LEADS_QUERY_ID = int(os.getenv("DUNE_BOT_LEADS_QUERY_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "discovery.db")
 MAX_CREDITS_PER_RUN = int(os.getenv("MAX_CREDITS_PER_RUN", "500"))
 

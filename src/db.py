@@ -85,6 +85,25 @@ def init_db(path: str = DB_PATH):
             ON token_purchases(address);
         CREATE INDEX IF NOT EXISTS idx_tp_direction
             ON token_purchases(direction, token_mint, block_time);
+
+        -- Copy bot lead tracking: records where a wallet bought BEFORE a known copy bot.
+        -- Each row = one token where lead_wallet preceded bot_wallet by lag_seconds.
+        -- Accumulates over time; use get_bot_leads_ranked() to surface the pattern.
+        CREATE TABLE IF NOT EXISTS bot_leads (
+            bot_wallet      TEXT NOT NULL,
+            lead_wallet     TEXT NOT NULL,
+            token_mint      TEXT NOT NULL,
+            lead_block_time INTEGER NOT NULL,
+            bot_block_time  INTEGER NOT NULL,
+            lag_seconds     INTEGER NOT NULL,
+            lead_sig        TEXT,
+            bot_sig         TEXT,
+            recorded_at     INTEGER NOT NULL,
+            PRIMARY KEY (bot_wallet, lead_wallet, token_mint)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bl_bot  ON bot_leads(bot_wallet);
+        CREATE INDEX IF NOT EXISTS idx_bl_lead ON bot_leads(lead_wallet);
     """)
     # Migration: add direction column to existing DBs that predate this schema
     try:
@@ -454,3 +473,74 @@ def get_sell_cluster_pairs(
         ).fetchall()
         return [dict(r) for r in rows]
 
+
+# ── Bot lead helpers ─────────────────────────────────────────────────────────
+
+def save_bot_lead(
+    bot_wallet: str,
+    lead_wallet: str,
+    token_mint: str,
+    lead_block_time: int,
+    bot_block_time: int,
+    lag_seconds: int,
+    lead_sig: str | None = None,
+    bot_sig: str | None = None,
+    path: str = DB_PATH,
+):
+    """Record that lead_wallet bought token_mint lag_seconds before bot_wallet."""
+    now = int(time.time())
+    with get_db(path) as db:
+        db.execute(
+            """INSERT OR REPLACE INTO bot_leads
+               (bot_wallet, lead_wallet, token_mint, lead_block_time,
+                bot_block_time, lag_seconds, lead_sig, bot_sig, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (bot_wallet, lead_wallet, token_mint, lead_block_time,
+             bot_block_time, lag_seconds, lead_sig, bot_sig, now),
+        )
+
+
+def get_bot_leads_ranked(bot_wallet: str, path: str = DB_PATH) -> list[dict]:
+    """
+    Return all wallets that preceded bot_wallet, ranked by how many tokens
+    they led on (descending) and average lag (ascending).
+    """
+    with get_db(path) as db:
+        rows = db.execute(
+            """
+            SELECT
+                lead_wallet,
+                COUNT(DISTINCT token_mint)              AS tokens_led,
+                AVG(lag_seconds)                        AS avg_lag_seconds,
+                MIN(lag_seconds)                        AS min_lag_seconds,
+                GROUP_CONCAT(DISTINCT token_mint)       AS token_mints
+            FROM bot_leads
+            WHERE bot_wallet = ?
+            GROUP BY lead_wallet
+            ORDER BY tokens_led DESC, avg_lag_seconds ASC
+            """,
+            (bot_wallet,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_lead_bot_map(lead_wallet: str, path: str = DB_PATH) -> list[dict]:
+    """
+    Reverse lookup: which bots has this wallet been leading?
+    Useful for confirming a wallet is being systematically copied.
+    """
+    with get_db(path) as db:
+        rows = db.execute(
+            """
+            SELECT
+                bot_wallet,
+                COUNT(DISTINCT token_mint)              AS tokens_led,
+                AVG(lag_seconds)                        AS avg_lag_seconds
+            FROM bot_leads
+            WHERE lead_wallet = ?
+            GROUP BY bot_wallet
+            ORDER BY tokens_led DESC
+            """,
+            (lead_wallet,),
+        ).fetchall()
+        return [dict(r) for r in rows]
