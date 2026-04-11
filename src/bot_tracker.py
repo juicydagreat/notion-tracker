@@ -17,6 +17,13 @@ a wallet that (a) consistently leads the bot, (b) co-buys the same tokens as
 other tracked wallets, and (c) sells simultaneously is almost certainly the
 same person operating multiple wallets.
 
+Seeding token data
+------------------
+`seed_token_buyers()` fetches all transactions for a specific token mint from
+the free public Solana RPC, extracts who bought/sold, and stores them in the
+local token_purchases DB.  This is the fastest way to populate data for a set
+of known training tokens without waiting for the daemon to run.
+
 Real-time integration
 ---------------------
 The WalletMonitor daemon can watch a bot wallet the same way it watches normal
@@ -32,10 +39,10 @@ cost; fetching cached results is free.
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable
 
 from src.config import DB_PATH
-from src.db import get_db, save_bot_lead, save_candidate
+from src.db import get_db, save_bot_lead, save_candidate, save_token_purchase
 from src.helius import HeliusClient, extract_token_actions
 from src.wallets import WalletRegistry
 
@@ -181,6 +188,127 @@ def _confidence(tokens_led: int, avg_lag: float) -> float:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+async def seed_token_buyers(
+    token_mint: str,
+    client: HeliusClient,
+    around_time: Optional[int] = None,
+    window_seconds: int = 300,
+    max_fetch: int = 500,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    path: str = DB_PATH,
+) -> int:
+    """
+    Fetch all transactions for a token mint via free RPC and store buyers/sellers
+    in the token_purchases table.
+
+    This seeds the local DB so that `investigate` and `find_bot_leads` have data
+    to work with immediately, without needing to run the daemon first.
+
+    Args:
+        token_mint:     The mint address to scan (e.g. a Pump.fun token).
+        client:         HeliusClient (uses free RPC — 0 Helius credits).
+        around_time:    Unix timestamp to center the scan on.  If given, only
+                        transactions within ±window_seconds of this time are
+                        saved.  If None, all fetched transactions are saved.
+        window_seconds: Half-width of the time window when around_time is set.
+        max_fetch:      Maximum total signatures to fetch (pagination cap).
+        on_progress:    Optional callback(fetched, saved) called each page.
+        path:           SQLite DB path.
+
+    Returns:
+        Number of token purchase/sell records saved.
+
+    How it works:
+        `getSignaturesForAddress(mint)` returns every transaction that touched
+        the token's mint account — every buy, sell, transfer, and mint.
+        We fetch these newest-first, stopping once we've gone far enough back
+        in time, then resolve each tx to extract who bought or sold.
+
+    Free RPC cost:
+        1 call per signature page (up to 1000 sigs) + 1 call per tx.
+        For a 5-minute window on an active Pump.fun token: typically 50-200 txs.
+    """
+    # Phase 1: collect signatures in the time window
+    collected: list[tuple[str, int, int]] = []  # (sig, slot, block_time)
+    before: Optional[str] = None
+    fetched_total = 0
+
+    lo_time = (around_time - window_seconds) if around_time else 0
+    hi_time = (around_time + window_seconds) if around_time else int(time.time()) + 9999
+
+    while fetched_total < max_fetch:
+        page = await client.get_signatures(token_mint, limit=min(200, max_fetch - fetched_total), before=before)
+        if not page:
+            break
+
+        for sig in page:
+            if sig.err:
+                continue
+            bt = sig.block_time or 0
+            # If we've gone before the window, stop paginating
+            if around_time and bt < lo_time:
+                fetched_total = max_fetch  # signal outer loop to stop
+                break
+            if lo_time <= bt <= hi_time:
+                collected.append((sig.signature, sig.slot, bt))
+
+        fetched_total += len(page)
+        before = page[-1].signature
+
+        if len(page) < 200:
+            break  # end of history
+
+    if not collected:
+        return 0
+
+    # Phase 2: fetch each tx and extract token actions
+    saved = 0
+    for i, (sig, slot, block_time) in enumerate(collected):
+        tx = await client.get_transaction(sig)
+        if not tx:
+            continue
+
+        # Determine fee payer
+        accounts = (
+            tx.get("transaction", {})
+            .get("message", {})
+            .get("accountKeys", [])
+        )
+        meta = tx.get("meta", {}) or {}
+        fee = meta.get("fee")
+        fee_payer: Optional[str] = None
+        for acc in accounts:
+            if isinstance(acc, dict):
+                if acc.get("signer") and acc.get("writable"):
+                    fee_payer = acc.get("pubkey")
+                    break
+            elif isinstance(acc, str) and fee_payer is None:
+                fee_payer = acc
+
+        if not fee_payer:
+            continue
+
+        actions = extract_token_actions(tx, fee_payer)
+        direction = actions.get(token_mint)
+        if direction in ("buy", "sell"):
+            save_token_purchase(
+                address=fee_payer,
+                token_mint=token_mint,
+                slot=slot,
+                block_time=block_time,
+                fee=fee,
+                signature=sig,
+                direction=direction,
+                path=path,
+            )
+            saved += 1
+
+        if on_progress:
+            on_progress(i + 1, saved)
+
+    return saved
+
+
 async def find_bot_leads(
     bot_wallet: str,
     client: HeliusClient,
@@ -310,10 +438,28 @@ async def investigate_tokens(
                     bot_buy_times[buy.token_mint] = buy
         result["bot_buys"] = bot_buy_times
 
-    # Step 2: For each token find buyers (before bot if bot given, else all)
+    # Step 2: For each token find buyers (before bot if bot given, else all).
+    # Auto-seed from chain if the local DB has no data for a token.
     lead_data: dict[str, dict[str, dict]] = defaultdict(dict)
 
     for mint in token_mints:
+        # Check if we already have local data for this mint
+        with get_db(path) as db:
+            local_count = db.execute(
+                "SELECT COUNT(*) FROM token_purchases WHERE token_mint = ?", (mint,)
+            ).fetchone()[0]
+
+        if local_count == 0:
+            # Auto-seed: fetch buyers from chain (free RPC)
+            ref_time = bot_buy_times[mint].bot_block_time if mint in bot_buy_times else None
+            result.setdefault("seeded", {})[mint] = await seed_token_buyers(
+                token_mint=mint,
+                client=client,
+                around_time=ref_time,
+                window_seconds=max(max_lag * 3, 300),  # generous window
+                path=path,
+            )
+
         if bot_wallet and mint in bot_buy_times:
             bot_buy = bot_buy_times[mint]
             leads = _find_leads_in_db(mint, bot_buy.bot_block_time, bot_wallet, max_lag, path)

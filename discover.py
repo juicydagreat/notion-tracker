@@ -15,10 +15,13 @@ Commands:
   dune-scan              Fetch Dune historical results and import into candidates DB
   dune-setup             Print Dune query setup instructions
 
-Copy Bot Analysis (requires daemon to have populated token_purchases, or Dune):
+Copy Bot Analysis:
+  seed-token <mint> [--bot <bot>] [--window N]
+                         Seed local DB with all buyers of a token mint (free RPC)
   bot-leads <bot>        Find wallets a copy bot is copying (local DB + live API)
   investigate <t1> [t2…] [--bot <bot>] [--max-lag N]
                          Find who bought these tokens before a known bot
+                         (auto-seeds from chain if no local data found)
   dune-bot-leads <bot>   Full 30-day bot-lead analysis via Dune Analytics
 """
 import asyncio
@@ -637,6 +640,74 @@ def cmd_candidates(registry: WalletRegistry, min_conf: float = 0.5):
                   f"Untracked = potential new wallet to add.[/dim]")
 
 
+async def cmd_seed_token(
+    token_mint: str,
+    bot_wallet: str = "",
+    window_seconds: int = 300,
+    max_fetch: int = 500,
+):
+    """
+    Fetch all transactions for a token mint from the free Solana RPC and
+    populate the local token_purchases DB.
+
+    If --bot is given, the scan window is centred on the bot's buy time.
+    Otherwise a flat window_seconds of history is fetched from the latest tx.
+
+    Uses 0 Helius credits (free public RPC only).
+    """
+    from src.bot_tracker import seed_token_buyers, _get_bot_buys
+
+    client = HeliusClient()
+    try:
+        around_time: int | None = None
+
+        if bot_wallet:
+            console.print(f"[dim]Looking up bot buy time for {token_mint[:20]}…[/dim]")
+            bot_buys = await _get_bot_buys(bot_wallet, client, lookback=200)
+            match = next((b for b in bot_buys if b.token_mint == token_mint), None)
+            if match:
+                around_time = match.bot_block_time
+                import datetime
+                ts = datetime.datetime.utcfromtimestamp(around_time).strftime("%Y-%m-%d %H:%M:%S")
+                console.print(
+                    f"[green]Bot bought at:[/green] {ts} UTC — "
+                    f"scanning ±{window_seconds}s window"
+                )
+            else:
+                console.print(
+                    f"[yellow]Bot buy not found for this token in last 200 txs.[/yellow] "
+                    f"Fetching latest {window_seconds}s instead."
+                )
+
+        total_sigs = [0]
+        total_saved = [0]
+
+        with console.status(f"[dim]Seeding {token_mint[:20]}…  0 fetched / 0 saved[/dim]") as status:
+            def on_progress(fetched: int, saved: int):
+                total_sigs[0] = fetched
+                total_saved[0] = saved
+                status.update(
+                    f"[dim]Seeding {token_mint[:20]}…  {fetched} txs fetched / {saved} records saved[/dim]"
+                )
+
+            saved = await seed_token_buyers(
+                token_mint=token_mint,
+                client=client,
+                around_time=around_time,
+                window_seconds=window_seconds,
+                max_fetch=max_fetch,
+                on_progress=on_progress,
+            )
+
+        console.print(
+            f"[green]✓[/green] Seeded [bold]{token_mint[:20]}…[/bold] — "
+            f"{saved} buyer/seller records saved to DB"
+        )
+        console.print(f"[dim]Credits used: {client.credits_used}[/dim]")
+    finally:
+        await client.close()
+
+
 async def cmd_bot_leads(
     bot_wallet: str,
     registry: WalletRegistry,
@@ -752,6 +823,14 @@ async def cmd_investigate(
                 max_lag=max_lag,
             )
 
+        # Seeding report
+        seeded = result.get("seeded", {})
+        if seeded:
+            for mint, n_saved in seeded.items():
+                console.print(
+                    f"[dim]Auto-seeded {mint[:20]}… → {n_saved} records[/dim]"
+                )
+
         # Bot buy reference times
         if result["bot_buys"]:
             console.print("\n[bold]Bot buy times (reference points):[/bold]")
@@ -810,10 +889,10 @@ async def cmd_investigate(
             console.print(t)
         else:
             console.print(
-                "\n[yellow]No token purchase data found in local DB.[/yellow]\n"
-                "[dim]The daemon must run to populate buy history.\n"
-                "For immediate results run: python discover.py dune-bot-leads " +
-                (bot_wallet or "<bot_wallet>") + "[/dim]"
+                "\n[yellow]No token purchase data found.[/yellow]\n"
+                "[dim]The tokens were auto-seeded from chain — "
+                "if results are still empty the bot's buy may not be in its last 200 txs "
+                "or no wallets bought within the lag window.[/dim]"
             )
 
         console.print(f"\n[dim]Credits used: {client.credits_used}[/dim]")
@@ -996,6 +1075,29 @@ async def main():
     elif cmd == "dune-setup":
         from src.dune import print_query_setup_guide
         print_query_setup_guide()
+
+    elif cmd == "seed-token":
+        if len(args) < 2:
+            console.print(
+                "[red]Usage:[/red] python discover.py seed-token <mint_address> "
+                "[--bot <bot_wallet>] [--window N] [--max-fetch N]"
+            )
+            return
+        init_db()
+        mint = args[1]
+        bot_wallet = ""
+        window = 300
+        max_fetch = 500
+        i = 2
+        while i < len(args):
+            if args[i] == "--bot" and i + 1 < len(args):
+                bot_wallet = args[i + 1]; i += 1
+            elif args[i] == "--window" and i + 1 < len(args):
+                window = int(args[i + 1]); i += 1
+            elif args[i] == "--max-fetch" and i + 1 < len(args):
+                max_fetch = int(args[i + 1]); i += 1
+            i += 1
+        await cmd_seed_token(mint, bot_wallet=bot_wallet, window_seconds=window, max_fetch=max_fetch)
 
     elif cmd == "bot-leads":
         if len(args) < 2:
