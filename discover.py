@@ -14,6 +14,7 @@ Commands:
   sell-clusters [window] Show wallets that sell same tokens together (default 10s window)
   dune-scan              Fetch Dune historical results and import into candidates DB
   dune-setup             Print Dune query setup instructions
+  notion-setup           Print Notion database setup instructions
 
 Copy Bot Analysis:
   seed-token <mint> [--bot <bot>] [--window N]
@@ -1075,6 +1076,10 @@ async def main():
     elif cmd == "dune-setup":
         from src.dune import print_query_setup_guide
         print_query_setup_guide()
+
+    elif cmd == "notion-setup":
+        from src.notion_writer import print_setup_guide
+        print_setup_guide()
 
     elif cmd == "seed-token":
         if len(args) < 2:

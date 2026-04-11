@@ -1,0 +1,115 @@
+name: Wallet Discovery
+
+on:
+  schedule:
+    # Run daily at 8 AM UTC — adjust to your preferred time
+    - cron: "0 8 * * *"
+
+  workflow_dispatch:
+    # Also runnable manually from the Actions tab with custom inputs
+    inputs:
+      bot_wallets:
+        description: "Comma-separated bot wallet address(es) to analyze"
+        required: false
+        default: ""
+      token_mints:
+        description: "Comma-separated token mint address(es) to investigate"
+        required: false
+        default: ""
+      max_lag_seconds:
+        description: "Max seconds between lead buy and bot buy (default: 60)"
+        required: false
+        default: "60"
+      skip_notion:
+        description: "Set to 1 to skip Notion output (dry run)"
+        required: false
+        default: "0"
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out the repo ───────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Restore the discovery DB from cache ──────────────────────────────
+      # The DB accumulates token_purchases and candidates over time.
+      # Each run saves a new cache entry so the DB grows progressively.
+      - name: Restore discovery DB
+        uses: actions/cache/restore@v4
+        with:
+          path: discovery.db
+          # Restore the most recent saved DB (any previous run)
+          key: discovery-db-never-exact-match
+          restore-keys: |
+            discovery-db-
+
+      # ── 5. Run discovery ─────────────────────────────────────────────────────
+      - name: Run wallet discovery
+        env:
+          # ── Required ────────────────────────────────────────────────────────
+          HELIUS_API_KEY:       ${{ secrets.HELIUS_API_KEY }}
+
+          # ── Notion output (required to push results to Notion) ───────────────
+          NOTION_TOKEN:         ${{ secrets.NOTION_TOKEN }}
+          NOTION_DISCOVERY_DB:  ${{ secrets.NOTION_DISCOVERY_DB }}
+
+          # ── What to analyze (use secrets for persistent config, ──────────────
+          #    or override per-run via workflow_dispatch inputs) ────────────────
+          BOT_WALLETS: >-
+            ${{
+              inputs.bot_wallets != '' && inputs.bot_wallets
+              || secrets.BOT_WALLETS
+            }}
+          TOKEN_MINTS: >-
+            ${{
+              inputs.token_mints != '' && inputs.token_mints
+              || secrets.TOKEN_MINTS
+            }}
+
+          # ── Tuning ───────────────────────────────────────────────────────────
+          MAX_LAG_SECONDS:      ${{ inputs.max_lag_seconds || '60' }}
+          SEED_WINDOW_SECONDS:  "300"
+          MIN_CONFIDENCE:       "0.55"
+          SKIP_NOTION:          ${{ inputs.skip_notion || '0' }}
+
+          # ── RPC ──────────────────────────────────────────────────────────────
+          FREE_RPC_URL:         "https://api.mainnet-beta.solana.com"
+          DB_PATH:              "discovery.db"
+          WALLETS_FILE:         "wallets.json"
+
+        run: python run_discover.py
+
+      # ── 6. Save updated DB to cache ─────────────────────────────────────────
+      # Always save — even if discovery found nothing, we want the seeded
+      # token_purchases data persisted for next run's pattern matching.
+      - name: Save discovery DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: discovery.db
+          # New key per run so this run's DB is always saved
+          key: discovery-db-${{ github.run_id }}
+
+      # ── 7. Upload DB as artifact (optional — for debugging) ─────────────────
+      - name: Upload discovery DB artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovery-db-${{ github.run_id }}
+          path: discovery.db
+          # Keep 30 days of DB snapshots
+          retention-days: 30
