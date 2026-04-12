@@ -3,21 +3,17 @@
 Solana → Notion daily balance tracker.
 Zero external dependencies — pure Python stdlib.
 
-HTTP calls per run:
-  1-6 batch getBalance calls (or 54 individual if batch is blocked)
-  1   getTokenAccountsByOwner for the single USDC wallet
-  1   Notion DB query for all previous per-wallet rows
-  1   Notion DB query for previous daily total
-  N   Notion page creates (one per wallet + 1 daily total)
+All wallet addresses are masked in logs (AbCd...XyZ1) so this script
+is safe to run on a public GitHub repository.
+
+Required secrets:
+  NOTION_TOKEN, NOTION_DB_PERWALLET, NOTION_DB_DAILYTOTAL,
+  WALLETS_CSV, USDC_WALLET, USDC_MINT, TITLE_PROP_PERWALLET
 
 RPC strategy:
-  1. Try batch JSON-RPC (fast — works with a proper API key)
-  2. If ALL batch endpoints return 403/fail, auto-fall back to individual
-     calls on api.mainnet-beta.solana.com with INDIVIDUAL_DELAY between each
-
-To use a free API key (recommended for reliability):
-  Sign up at alchemy.com (free, no credit card), create a Solana app,
-  then set SOLANA_PRIMARY_RPC secret to your Alchemy endpoint URL.
+  1. Try batch JSON-RPC via SOLANA_PRIMARY_RPC / SOLANA_FALLBACK_RPC
+  2. If batch is blocked (403), fall back to sequential individual calls
+     on api.mainnet-beta.solana.com with INDIVIDUAL_DELAY between each
 """
 import os, sys, json, time, random, re
 import urllib.request, urllib.error
@@ -28,24 +24,22 @@ NOTION_TOKEN         = os.environ["NOTION_TOKEN"].strip()
 NOTION_DB_PERWALLET  = os.environ["NOTION_DB_PERWALLET"].strip()
 NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"].strip()
 WALLETS_CSV          = os.environ["WALLETS_CSV"]
-USDC_MINT            = os.environ.get("USDC_MINT",   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
-USDC_WALLET          = os.environ.get("USDC_WALLET", "33EUErqH7mog7U2XdtXaZL7S1EEpJw1TEv7dswm76SzM").strip()
+USDC_MINT            = os.environ["USDC_MINT"].strip()
+USDC_WALLET          = os.environ["USDC_WALLET"].strip()
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
 
-RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",      "30"))
-RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",      "5"))
-RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP", "30.0"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",        "10"))
-BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",     "2.0"))
+RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",       "30"))
+RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
+RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "10"))
+BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",      "2.0"))
 INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
 
-# Batch RPC endpoints (tried in order)
 _rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://solana-rpc.publicnode.com").strip()
 _rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://rpc.ankr.com/solana").strip()
 RPC_URLS = list(dict.fromkeys([_rpc_primary, _rpc_fallback]))
 
-# Individual fallback RPC — public mainnet-beta works fine for sequential calls
 INDIVIDUAL_RPC = os.environ.get("INDIVIDUAL_RPC", "https://api.mainnet-beta.solana.com").strip()
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
@@ -55,6 +49,7 @@ PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 def fail(msg):  print(f"ERROR: {msg}", flush=True); sys.exit(1)
 def log(msg):   print(msg, flush=True)
 def r2(x):      return None if x is None else round(float(x), 2)
+def mask(addr): return f"{addr[:4]}...{addr[-4:]}" if len(addr) >= 8 else addr
 
 
 def parse_wallets(raw):
@@ -94,12 +89,6 @@ def _http_post(url, payload):
 
 
 def rpc_call(payload):
-    """
-    Batch or single JSON-RPC call. Tries each URL in RPC_URLS:
-      - 401/403  → skip to next URL (bad key)
-      - 429/5xx  → retry with backoff
-    Raises if all URLs fail.
-    """
     last_err = None
     for url_idx, url in enumerate(RPC_URLS):
         if url_idx > 0:
@@ -116,7 +105,7 @@ def rpc_call(payload):
                 except: detail = ""
                 last_err = f"HTTP {e.code}: {detail}"
                 if e.code in _NEXT_URL_CODES:
-                    log(f"  [{e.code}] bad/missing API key on {url}, trying next endpoint")
+                    log(f"  [{e.code}] batch blocked on {url}, trying next endpoint")
                     skip_to_next = True
                     break
                 elif e.code in _RETRY_CODES:
@@ -134,10 +123,6 @@ def rpc_call(payload):
 
 
 def single_rpc_call(payload):
-    """
-    Single JSON-RPC call to INDIVIDUAL_RPC with retry.
-    Used as fallback when batch RPC endpoints are blocked.
-    """
     last_err = None
     for attempt in range(RPC_RETRIES):
         try:
@@ -159,19 +144,8 @@ def single_rpc_call(payload):
     raise Exception(f"Individual RPC call failed: {last_err}")
 
 
-def rpc_call_with_fallback(payload):
-    """Try batch RPC endpoints first; if all fail, use the individual RPC."""
-    try:
-        return rpc_call(payload)
-    except Exception:
-        return single_rpc_call(payload)
-
-
 def batch_get_sol(wallets):
-    """
-    Fetch SOL balances for all wallets.
-    Fast path: batch JSON-RPC. Fallback: individual calls on INDIVIDUAL_RPC.
-    """
+    # Fast path: batch RPC
     try:
         results = {}
         indexed = list(enumerate(wallets))
@@ -187,21 +161,22 @@ def batch_get_sol(wallets):
                 raise Exception(f"Expected list from batch RPC, got: {type(resp)}")
             for item in resp:
                 if item.get("error"):
-                    raise Exception(f"getBalance error wallet #{item['id']}: {item['error']}")
+                    raise Exception(f"getBalance error #{item['id']}: {item['error']}")
                 results[item["id"]] = item["result"]["value"] / 1e9
         return [results[i] for i in range(len(wallets))]
     except Exception as batch_err:
-        log(f"\n  Batch mode failed: {batch_err}")
+        log(f"  Batch mode failed: {batch_err}")
         log(f"  Falling back to individual calls on {INDIVIDUAL_RPC}")
-        log(f"  ({len(wallets)} wallets x {INDIVIDUAL_DELAY}s delay = ~{len(wallets)*INDIVIDUAL_DELAY:.0f}s)")
+        log(f"  ({len(wallets)} wallets x {INDIVIDUAL_DELAY}s = ~{len(wallets)*INDIVIDUAL_DELAY:.0f}s)")
 
+    # Fallback: individual calls
     results = []
     for i, wallet in enumerate(wallets):
         resp = single_rpc_call(
             {"jsonrpc": "2.0", "id": 1, "method": "getBalance", "params": [wallet]}
         )
         sol = resp["result"]["value"] / 1e9
-        log(f"  [{i+1:02d}/{len(wallets)}] {sol:.4f} SOL  {wallet}")
+        log(f"  [{i+1:02d}/{len(wallets)}] {sol:.4f} SOL  {mask(wallet)}")
         results.append(sol)
         if i < len(wallets) - 1:
             time.sleep(INDIVIDUAL_DELAY)
@@ -209,7 +184,6 @@ def batch_get_sol(wallets):
 
 
 def get_usdc_balance(wallet):
-    """Fetch USDC balance for a single wallet. Falls back to individual RPC if batch blocked."""
     payload = {
         "jsonrpc": "2.0", "id": 1,
         "method": "getTokenAccountsByOwner",
@@ -218,7 +192,7 @@ def get_usdc_balance(wallet):
     try:
         resp = rpc_call(payload)
     except Exception:
-        log(f"  Batch RPC blocked for USDC, using individual fallback ({INDIVIDUAL_RPC})")
+        log(f"  Batch RPC blocked for USDC, using individual fallback")
         resp = single_rpc_call(payload)
 
     total = 0.0
@@ -325,8 +299,8 @@ def create_page(db_id, props):
 # ── Main ──────────────────────────────────────────────────────────────────────────────
 def main():
     log("=" * 60)
-    log(f"Batch RPC endpoints: {RPC_URLS}")
-    log(f"Individual fallback: {INDIVIDUAL_RPC}")
+    log(f"Batch RPC: {RPC_URLS}")
+    log(f"Fallback RPC: {INDIVIDUAL_RPC}")
 
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
@@ -334,20 +308,17 @@ def main():
 
     today = datetime.now(timezone.utc).date().isoformat()
     log(f"Date: {today}  |  Wallets: {len(wallets)}")
-    log(f"USDC wallet: {USDC_WALLET}")
-    for i, w in enumerate(wallets, 1):
-        log(f"  {i:02d}. {w}")
 
-    log(f"\n--- Fetching SOL balances ---")
+    log(f"\n--- Fetching SOL balances ({len(wallets)} wallets) ---")
     sol_list = batch_get_sol(wallets)
     total_sol = r2(sum(sol_list))
     log(f"Total SOL: {total_sol}")
 
     time.sleep(BATCH_PAUSE)
 
-    log(f"\n--- Fetching USDC balance ({USDC_WALLET}) ---")
+    log(f"\n--- Fetching USDC balance ---")
     usdc_total = r2(get_usdc_balance(USDC_WALLET))
-    log(f"  {usdc_total} USDC")
+    log(f"  Total USDC: {usdc_total}")
     usdc_list = [usdc_total if w == USDC_WALLET else 0.0 for w in wallets]
 
     log(f"\nSummary: Total SOL={total_sol}  Total USDC={usdc_total}")
@@ -358,13 +329,13 @@ def main():
     log(f"  {len(prev_lookup)} previous per-wallet rows found")
 
     log(f"\n--- Writing {len(wallets)} per-wallet rows to Notion ---")
-    for w, sol, usdc in zip(wallets, sol_list, usdc_list):
+    for i, (w, sol, usdc) in enumerate(zip(wallets, sol_list, usdc_list), 1):
         sol  = r2(sol)
         usdc = r2(usdc)
         prev   = prev_lookup.get(w)
         d_sol  = r2(sol  - get_num(prev, "End Balance"))      if prev else None
         d_usdc = r2(usdc - get_num(prev, "USDC End Balance")) if prev else None
-        log(f"  {w}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}")
+        log(f"  [{i:02d}/{len(wallets)}] {mask(w)}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}")
         create_page(NOTION_DB_PERWALLET, {
             TITLE_PROP:         {"title": [{"text": {"content": w}}]},
             "Date":             {"date":  {"start": today}},
