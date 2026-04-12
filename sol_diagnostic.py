@@ -112,8 +112,6 @@ def main():
     print(f"Wallet count:  {len(wallets)}")
     print(f"Batch size:    {BATCH_SIZE}")
     print("=" * 60)
-    for i, w in enumerate(wallets, 1):
-        print(f"  {i:3d}. {w}")
     print()
 
     print("Fetching SOL balances (batch)...")
@@ -127,8 +125,8 @@ def main():
     print("=" * 60)
     print("SORTED BALANCES")
     print("=" * 60)
-    for i, (w, s) in enumerate(rows, 1):
-        print(f"  {i:3d}. {s:>14.9f} SOL  {w}")
+    for i, (_, s) in enumerate(rows, 1):
+        print(f"  {i:3d}.  {s:>14.9f} SOL")
 
     print()
     print("=" * 60)
@@ -136,9 +134,7 @@ def main():
     print(f"Wallets:      {len(wallets)}")
     print(f"Zero-balance: {len(zero)}")
     if zero:
-        print("  Zero-balance wallets:")
-        for w in zero:
-            print(f"    {w}")
+        print(f"  {len(zero)} zero-balance wallet(s) — check if intentional or fetch error")
     print("=" * 60)
 
 

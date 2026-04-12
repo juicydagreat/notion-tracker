@@ -24,8 +24,8 @@ NOTION_DB_PERWALLET  = os.environ["NOTION_DB_PERWALLET"].strip()
 NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"].strip()
 WALLETS_CSV          = os.environ["WALLETS_CSV"]
 SOLANA_RPC_URL       = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
-USDC_MINT            = os.environ.get("USDC_MINT",   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").strip()
-USDC_WALLET          = os.environ.get("USDC_WALLET", "33EUErqH7mog7U2XdtXaZL7S1EEpJw1TEv7dswm76SzM").strip()
+USDC_MINT            = os.environ["USDC_MINT"].strip()
+USDC_WALLET          = os.environ["USDC_WALLET"].strip()
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
 
@@ -257,21 +257,18 @@ def main():
 
     log("=" * 60)
     log(f"Date: {today}  |  Wallets: {len(wallets)}")
-    log(f"USDC wallet: {USDC_WALLET}")
-    for i, w in enumerate(wallets, 1):
-        log(f"  {i:02d}. {w}")
 
     # — 1 batch HTTP call for all SOL balances —
     log(f"\n--- Fetching SOL balances (batch, size={BATCH_SIZE}) ---")
     sol_list = batch_get_sol(wallets)
     total_sol = r2(sum(sol_list))
-    for w, s in zip(wallets, sol_list):
-        log(f"  {s:>10.4f} SOL  {w}")
+    for i, s in enumerate(sol_list, 1):
+        log(f"  {i:02d}/{len(wallets)} | {s:>10.4f} SOL")
 
     time.sleep(BATCH_PAUSE)
 
     # — 1 single HTTP call for USDC (one wallet only) —
-    log(f"\n--- Fetching USDC balance ({USDC_WALLET}) ---")
+    log(f"\n--- Fetching USDC balance ---")
     usdc_total = r2(get_usdc_balance(USDC_WALLET))
     log(f"  {usdc_total} USDC")
     # Map USDC to the right wallet; all others get 0
@@ -287,13 +284,13 @@ def main():
 
     # — Write per-wallet rows —
     log(f"\n--- Writing {len(wallets)} per-wallet rows to Notion ---")
-    for w, sol, usdc in zip(wallets, sol_list, usdc_list):
+    for i, (w, sol, usdc) in enumerate(zip(wallets, sol_list, usdc_list), 1):
         sol  = r2(sol)
         usdc = r2(usdc)
         prev   = prev_lookup.get(w)
         d_sol  = r2(sol  - get_num(prev, "End Balance"))      if prev else None
         d_usdc = r2(usdc - get_num(prev, "USDC End Balance")) if prev else None
-        log(f"  {w}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}")
+        log(f"  [{i:02d}/{len(wallets)}] SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}")
         create_page(NOTION_DB_PERWALLET, {
             TITLE_PROP:         {"title": [{"text": {"content": w}}]},
             "Date":             {"date":  {"start": today}},
