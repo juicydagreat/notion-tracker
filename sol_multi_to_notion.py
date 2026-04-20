@@ -281,12 +281,12 @@ def get_prev_total_row(today):
 
 def get_num(page, prop):
     if page is None:
-        return 0.0
+        return None
     try:
         v = page["properties"][prop]["number"]
-        return float(v) if v is not None else 0.0
+        return float(v) if v is not None else None
     except (KeyError, TypeError):
-        return 0.0
+        return None
 
 
 def create_page(db_id, props):
@@ -332,9 +332,11 @@ def main():
     for i, (w, sol, usdc) in enumerate(zip(wallets, sol_list, usdc_list), 1):
         sol  = r2(sol)
         usdc = r2(usdc)
-        prev   = prev_lookup.get(w)
-        d_sol  = r2(sol  - get_num(prev, "End Balance"))      if prev else None
-        d_usdc = r2(usdc - get_num(prev, "USDC End Balance")) if prev else None
+        prev      = prev_lookup.get(w)
+        prev_sol  = get_num(prev, "End Balance")
+        prev_usdc = get_num(prev, "USDC End Balance")
+        d_sol  = r2(sol  - prev_sol)  if prev_sol  is not None else None
+        d_usdc = r2(usdc - prev_usdc) if prev_usdc is not None else None
         log(f"  [{i:02d}/{len(wallets)}] {mask(w)}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}")
         create_page(NOTION_DB_PERWALLET, {
             TITLE_PROP:         {"title": [{"text": {"content": w}}]},
@@ -348,8 +350,8 @@ def main():
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
     p_usdc_t = get_num(prev_total, "USDC End Balance")
-    d_sol_t  = r2(total_sol  - p_sol_t)  if prev_total else None
-    d_usdc_t = r2(usdc_total - p_usdc_t) if prev_total else None
+    d_sol_t  = r2(total_sol  - p_sol_t)  if p_sol_t  is not None else None
+    d_usdc_t = r2(usdc_total - p_usdc_t) if p_usdc_t is not None else None
     log(f"  SOL={total_sol} \u0394{d_sol_t}  USDC={usdc_total} \u0394{d_usdc_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
         "Name":             {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},
