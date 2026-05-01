@@ -221,20 +221,33 @@ def notion_headers():
 
 
 def notion_req(url, body, method="POST"):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers=notion_headers(),
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-            if isinstance(data, dict) and data.get("object") == "error":
-                raise Exception(f"Notion error: {data}")
-            return data
-    except urllib.error.HTTPError as e:
-        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+    last_err = None
+    for attempt in range(RPC_RETRIES):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers=notion_headers(),
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                if isinstance(data, dict) and data.get("object") == "error":
+                    raise Exception(f"Notion error: {data}")
+                return data
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode()
+            last_err = f"Notion HTTP {e.code}: {body_text}"
+            if e.code in _RETRY_CODES:
+                log(f"  [notion] {last_err}, retrying")
+                backoff(attempt)
+            else:
+                raise Exception(last_err)
+        except Exception as ex:
+            last_err = str(ex)
+            log(f"  [notion] {last_err}, retrying")
+            backoff(attempt)
+    raise Exception(f"Notion request failed after {RPC_RETRIES} attempts: {last_err}")
 
 
 def notion_query_paginated(db_id, body):
