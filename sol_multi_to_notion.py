@@ -34,7 +34,9 @@ RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "10"))
 BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",      "2.0"))
-INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
+INDIVIDUAL_DELAY  = float(os.environ.get("INDIVIDUAL_DELAY",  "2.0"))
+NOTION_TIMEOUT    = int(os.environ.get("NOTION_TIMEOUT",    "30"))
+NOTION_RETRIES    = int(os.environ.get("NOTION_RETRIES",    "4"))
 
 _rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://solana-rpc.publicnode.com").strip()
 _rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://rpc.ankr.com/solana").strip()
@@ -220,21 +222,35 @@ def notion_headers():
     }
 
 
+_NOTION_RETRY_CODES = {408, 425, 429, 500, 502, 503, 504}
+
 def notion_req(url, body, method="POST"):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers=notion_headers(),
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-            if isinstance(data, dict) and data.get("object") == "error":
-                raise Exception(f"Notion error: {data}")
-            return data
-    except urllib.error.HTTPError as e:
-        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+    last_err = None
+    for attempt in range(NOTION_RETRIES):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers=notion_headers(),
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=NOTION_TIMEOUT) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                if isinstance(data, dict) and data.get("object") == "error":
+                    raise Exception(f"Notion error: {data}")
+                return data
+        except urllib.error.HTTPError as e:
+            last_err = f"Notion HTTP {e.code}: {e.read().decode()}"
+            if e.code in _NOTION_RETRY_CODES:
+                log(f"  [notion] {last_err}, retrying")
+                backoff(attempt)
+            else:
+                raise Exception(last_err)
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            last_err = str(e)
+            log(f"  [notion] network error: {last_err}, retrying")
+            backoff(attempt)
+    raise Exception(f"Notion request failed after {NOTION_RETRIES} attempts: {last_err}")
 
 
 def notion_query_paginated(db_id, body):
