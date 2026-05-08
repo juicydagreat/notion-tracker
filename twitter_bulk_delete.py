@@ -1,272 +1,310 @@
 #!/usr/bin/env python3
 """
-Twitter Bulk Delete - deletes all tweets for an account using Twitter API v2.
+Twitter Bulk Delete
+───────────────────
+Just run:  python3 twitter_bulk_delete.py
 
-Setup:
-  1. Go to https://developer.twitter.com/en/portal/dashboard
-  2. Create a Free tier app (read+write permissions)
-  3. Generate OAuth 1.0a keys (API Key, API Secret, Access Token, Access Token Secret)
-  4. Create a .env file or export the variables below:
-
-  TWITTER_API_KEY=...
-  TWITTER_API_SECRET=...
-  TWITTER_ACCESS_TOKEN=...
-  TWITTER_ACCESS_TOKEN_SECRET=...
-
-Usage:
-  python3 twitter_bulk_delete.py            # live delete
-  python3 twitter_bulk_delete.py --dry-run  # preview only, no deletions
+You'll be asked for your username and password.
+Everything else is automatic.
 """
 
-import os
-import sys
-import time
-import hmac
-import hashlib
-import base64
-import urllib.parse
-import secrets
-import argparse
-import json
-import requests
+import subprocess, sys, importlib
 
-# ── Rate-limit constants (Twitter API v2 free tier) ─────────────────────────
-# DELETE /2/tweets/:id  → 50 requests / 15 min per user
-# GET /2/users/:id/tweets → 10 requests / 15 min per user
-FETCH_LIMIT    = 10          # max fetches before forced rest
-FETCH_WINDOW   = 15 * 60    # 15 minutes in seconds
-DELETE_LIMIT   = 50          # max deletes before forced rest
-DELETE_WINDOW  = 15 * 60
-DELETE_BATCH_SLEEP = 1.2    # polite delay between individual deletes (seconds)
+# ── Auto-install missing packages ────────────────────────────────────────────
+def install(pkg, import_as=None):
+    name = import_as or pkg
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        print(f"Installing {pkg}…")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
+install("playwright")
+install("getpass")  # stdlib, but harmless
 
-def load_env():
-    """Load credentials from .env file if present."""
-    env_path = os.path.join(os.path.dirname(__file__), ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
+# Install playwright browsers if needed
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
+    from playwright.sync_api import sync_playwright
 
+import time, json, getpass, re, requests
 
-def get_creds():
-    load_env()
-    keys = [
-        "TWITTER_API_KEY",
-        "TWITTER_API_SECRET",
-        "TWITTER_ACCESS_TOKEN",
-        "TWITTER_ACCESS_TOKEN_SECRET",
-    ]
-    creds = {k: os.environ.get(k) for k in keys}
-    missing = [k for k, v in creds.items() if not v]
-    if missing:
-        print("Missing credentials:", ", ".join(missing))
-        print(__doc__)
+# ── Rate limit constants ──────────────────────────────────────────────────────
+DELETE_LIMIT        = 50      # Twitter allows 50 deletes per 15 min
+DELETE_WINDOW       = 15 * 60
+DELAY_BETWEEN       = 1.2    # seconds between each delete
+
+# ── Step 1: log in via real browser, grab auth tokens ────────────────────────
+def get_tokens(username: str, password: str) -> dict:
+    print("\nOpening browser to log in…")
+    tokens = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=100)
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto("https://twitter.com/i/flow/login", wait_until="domcontentloaded")
+        time.sleep(2)
+
+        # Username
+        page.get_by_label("Phone, email, or username").fill(username)
+        page.get_by_role("button", name="Next").click()
+        time.sleep(2)
+
+        # Sometimes Twitter asks for email/phone verification
+        unusual = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
+        if unusual:
+            print("\nTwitter is asking for your email or phone number as a check.")
+            extra = input("Enter it here: ").strip()
+            unusual.fill(extra)
+            page.get_by_role("button", name="Next").click()
+            time.sleep(2)
+
+        # Password
+        pwd_field = page.query_selector('input[type="password"]')
+        if not pwd_field:
+            page.get_by_label("Password").fill(password)
+        else:
+            pwd_field.fill(password)
+        page.get_by_role("button", name="Log in").click()
+        time.sleep(4)
+
+        # Handle 2FA if present
+        tfa = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
+        if tfa:
+            code = input("\n2FA code (check your authenticator app or SMS): ").strip()
+            tfa.fill(code)
+            page.get_by_role("button", name="Next").click()
+            time.sleep(3)
+
+        # Extract cookies for API calls
+        cookies = context.cookies()
+        for c in cookies:
+            if c["name"] == "auth_token":
+                tokens["auth_token"] = c["value"]
+            if c["name"] == "ct0":
+                tokens["ct0"] = c["value"]
+
+        browser.close()
+
+    if not tokens.get("auth_token"):
+        print("\nCould not log in. Check your username/password and try again.")
         sys.exit(1)
-    return creds
+
+    print("Logged in successfully.\n")
+    return tokens
 
 
-# ── OAuth 1.0a signing ───────────────────────────────────────────────────────
-
-def _pct(s: str) -> str:
-    return urllib.parse.quote(str(s), safe="")
-
-
-def oauth1_header(method: str, url: str, params: dict, creds: dict) -> str:
-    oauth_params = {
-        "oauth_consumer_key":     creds["TWITTER_API_KEY"],
-        "oauth_nonce":            secrets.token_hex(16),
-        "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp":        str(int(time.time())),
-        "oauth_token":            creds["TWITTER_ACCESS_TOKEN"],
-        "oauth_version":          "1.0",
+# ── Step 2: get the numeric user ID ──────────────────────────────────────────
+def get_user_id(username: str, tokens: dict) -> str:
+    url = "https://api.twitter.com/graphql/SAMkL5y_N9pmahSw8yy6gA/UserByScreenName"
+    params = {
+        "variables": json.dumps({"screen_name": username.lstrip("@"), "withSafetyModeUserFields": True}),
+        "features":  json.dumps({"hidden_profile_likes_enabled": True, "hidden_profile_subscriptions_enabled": True,
+                                  "rweb_tipjar_consumption_enabled": True, "verified_phone_label_enabled": False,
+                                  "subscriptions_verification_info_is_identity_verified_enabled": True,
+                                  "subscriptions_verification_info_verified_since_enabled": True,
+                                  "highlights_tweets_tab_ui_enabled": True, "responsive_web_twitter_article_notes_tab_enabled": False,
+                                  "creator_subscriptions_tweet_preview_api_enabled": True,
+                                  "responsive_web_graphql_exclude_directive_enabled": True,
+                                  "verified_phone_label_enabled": False, "creator_subscriptions_tweet_preview_api_enabled": True,
+                                  "responsive_web_graphql_timeline_navigation_enabled": True,
+                                  "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+                                  "tweetypie_unmention_optimization_enabled": True, "responsive_web_edit_tweet_api_enabled": True,
+                                  "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+                                  "view_counts_everywhere_api_enabled": True, "longform_notetweets_consumption_enabled": True,
+                                  "responsive_web_twitter_article_tweet_consumption_enabled": False,
+                                  "tweet_awards_web_tipping_enabled": False, "freedom_of_speech_not_reach_fetch_enabled": True,
+                                  "standardized_nudges_misinfo": True, "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+                                  "rweb_video_timestamps_enabled": True, "longform_notetweets_rich_text_read_enabled": True,
+                                  "longform_notetweets_inline_media_enabled": True, "responsive_web_enhance_cards_enabled": False}},
     }
-    all_params = {**params, **oauth_params}
-    sorted_params = "&".join(
-        f"{_pct(k)}={_pct(v)}"
-        for k, v in sorted(all_params.items())
-    )
-    base = "&".join([_pct(method.upper()), _pct(url), _pct(sorted_params)])
-    signing_key = "&".join([
-        _pct(creds["TWITTER_API_SECRET"]),
-        _pct(creds["TWITTER_ACCESS_TOKEN_SECRET"]),
-    ])
-    sig = base64.b64encode(
-        hmac.new(signing_key.encode(), base.encode(), hashlib.sha1).digest()
-    ).decode()
-    oauth_params["oauth_signature"] = sig
-    header_parts = ", ".join(
-        f'{_pct(k)}="{_pct(v)}"' for k, v in sorted(oauth_params.items())
-    )
-    return f"OAuth {header_parts}"
-
-
-# ── API helpers ──────────────────────────────────────────────────────────────
-
-def get_user_id(creds: dict) -> tuple[str, str]:
-    """Return (user_id, username) for the authenticated user."""
-    url = "https://api.twitter.com/2/users/me"
-    headers = {"Authorization": oauth1_header("GET", url, {}, creds)}
-    r = requests.get(url, headers=headers, timeout=30)
+    headers = _headers(tokens)
+    r = requests.get(url, params=params, headers=headers, timeout=30)
     r.raise_for_status()
-    data = r.json()["data"]
-    return data["id"], data["username"]
+    return r.json()["data"]["user"]["result"]["rest_id"]
 
 
-def fetch_tweet_ids(user_id: str, creds: dict) -> list[str]:
-    """
-    Fetch all tweet IDs for the user, respecting the 10-req/15-min limit.
-    Returns a flat list of tweet IDs (strings).
-    """
-    url = f"https://api.twitter.com/2/users/{user_id}/tweets"
-    ids: list[str] = []
-    pagination_token = None
-    fetch_count = 0
-    window_start = time.time()
+# ── Step 3: fetch all tweet IDs ───────────────────────────────────────────────
+def fetch_all_ids(user_id: str, tokens: dict) -> list[str]:
+    print("Fetching your tweets…")
+    ids = []
+    cursor = None
+    url = "https://api.twitter.com/graphql/V7H0Ap3_Hh2FyS75OCDO3Q/UserTweets"
 
-    print("Fetching tweet IDs…", flush=True)
+    features = json.dumps({
+        "rweb_tipjar_consumption_enabled": True,
+        "responsive_web_graphql_exclude_directive_enabled": True,
+        "verified_phone_label_enabled": False,
+        "creator_subscriptions_tweet_preview_api_enabled": True,
+        "responsive_web_graphql_timeline_navigation_enabled": True,
+        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+        "communities_web_enable_tweet_community_results_fetch": True,
+        "c9s_tweet_anatomy_moderator_badge_enabled": True,
+        "articles_preview_enabled": True,
+        "tweetypie_unmention_optimization_enabled": True,
+        "responsive_web_edit_tweet_api_enabled": True,
+        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+        "view_counts_everywhere_api_enabled": True,
+        "longform_notetweets_consumption_enabled": True,
+        "responsive_web_twitter_article_tweet_consumption_enabled": True,
+        "tweet_awards_web_tipping_enabled": False,
+        "creator_subscriptions_quote_tweet_preview_enabled": False,
+        "freedom_of_speech_not_reach_fetch_enabled": True,
+        "standardized_nudges_misinfo": True,
+        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+        "rweb_video_timestamps_enabled": True,
+        "longform_notetweets_rich_text_read_enabled": True,
+        "longform_notetweets_inline_media_enabled": True,
+        "responsive_web_enhance_cards_enabled": False,
+    })
+
     while True:
-        # enforce fetch rate limit
-        fetch_count += 1
-        if fetch_count > FETCH_LIMIT:
-            elapsed = time.time() - window_start
-            wait = FETCH_WINDOW - elapsed
-            if wait > 0:
-                print(f"  Fetch limit reached — sleeping {wait:.0f}s…", flush=True)
-                time.sleep(wait)
-            fetch_count = 1
-            window_start = time.time()
+        variables = {"userId": user_id, "count": 200, "includePromotedContent": False}
+        if cursor:
+            variables["cursor"] = cursor
 
-        params = {"max_results": "100", "tweet.fields": "id"}
-        if pagination_token:
-            params["pagination_token"] = pagination_token
-
-        headers = {"Authorization": oauth1_header("GET", url, params, creds)}
-        r = requests.get(url, params=params, headers=headers, timeout=30)
+        params = {"variables": json.dumps(variables), "features": features}
+        r = requests.get(url, params=params, headers=_headers(tokens), timeout=30)
 
         if r.status_code == 429:
-            reset = int(r.headers.get("x-rate-limit-reset", time.time() + 60))
-            wait = max(reset - time.time(), 1) + 5
-            print(f"  Rate limited on fetch — sleeping {wait:.0f}s…", flush=True)
-            time.sleep(wait)
-            fetch_count = 0
-            window_start = time.time()
+            print("  Pausing for rate limit…")
+            time.sleep(60)
             continue
-
         r.raise_for_status()
-        body = r.json()
-        batch = [t["id"] for t in body.get("data", [])]
-        ids.extend(batch)
-        print(f"  Fetched {len(ids)} tweet IDs so far…", flush=True)
 
-        next_token = body.get("meta", {}).get("next_token")
-        if not next_token:
+        body = r.json()
+        entries = (
+            body.get("data", {})
+                .get("user", {})
+                .get("result", {})
+                .get("timeline_v2", {})
+                .get("timeline", {})
+                .get("instructions", [])
+        )
+
+        batch_ids = []
+        next_cursor = None
+        for instruction in entries:
+            for entry in instruction.get("entries", []):
+                entry_id = entry.get("entryId", "")
+                content = entry.get("content", {})
+                # tweet entry
+                if "tweet-" in entry_id:
+                    result = (
+                        content.get("itemContent", {})
+                               .get("tweet_results", {})
+                               .get("result", {})
+                    )
+                    tid = result.get("rest_id") or result.get("tweet", {}).get("rest_id")
+                    if tid:
+                        batch_ids.append(tid)
+                # cursor-bottom for pagination
+                if content.get("cursorType") == "Bottom":
+                    next_cursor = content.get("value")
+
+        ids.extend(batch_ids)
+        print(f"  Found {len(ids)} so far…", flush=True)
+
+        if not batch_ids or not next_cursor:
             break
-        pagination_token = next_token
+        cursor = next_cursor
 
     return ids
 
 
-def delete_tweets(tweet_ids: list[str], creds: dict, dry_run: bool):
-    """Delete tweets one by one, respecting the 50-req/15-min delete limit."""
-    total = len(tweet_ids)
-    if total == 0:
-        print("No tweets to delete.")
-        return
-
-    action = "Would delete" if dry_run else "Deleting"
-    print(f"\n{action} {total} tweet(s)…\n", flush=True)
-
+# ── Step 4: delete tweets ─────────────────────────────────────────────────────
+def delete_all(tweet_ids: list[str], tokens: dict):
+    total   = len(tweet_ids)
     deleted = 0
     failed  = 0
-    batch_count = 0
+    batch   = 0
     window_start = time.time()
 
-    for i, tweet_id in enumerate(tweet_ids, 1):
-        # enforce delete rate limit
-        batch_count += 1
-        if batch_count > DELETE_LIMIT:
+    print(f"\nDeleting {total} tweet(s). This may take a while — don't close the window.\n")
+
+    for i, tid in enumerate(tweet_ids, 1):
+        batch += 1
+        if batch > DELETE_LIMIT:
             elapsed = time.time() - window_start
-            wait = DELETE_WINDOW - elapsed
+            wait    = DELETE_WINDOW - elapsed
             if wait > 0:
-                print(f"\n  Delete limit reached — sleeping {wait:.0f}s…\n", flush=True)
-                time.sleep(wait)
-            batch_count = 1
+                mins = int(wait // 60) + 1
+                print(f"\n  Pausing {mins} min to avoid rate limits…\n", flush=True)
+                time.sleep(wait + 5)
+            batch = 1
             window_start = time.time()
 
-        if dry_run:
-            print(f"  [{i}/{total}] DRY RUN — tweet {tweet_id}")
-            time.sleep(0.05)
-            continue
-
-        url = f"https://api.twitter.com/2/tweets/{tweet_id}"
-        headers = {"Authorization": oauth1_header("DELETE", url, {}, creds)}
-
+        url  = "https://api.twitter.com/graphql/VaenaVgh5q5ih7kvyVjgtg/DeleteTweet"
+        body = {
+            "variables":       {"tweet_id": tid, "dark_request": False},
+            "queryId":         "VaenaVgh5q5ih7kvyVjgtg",
+        }
+        headers = {**_headers(tokens), "Content-Type": "application/json"}
         try:
-            r = requests.delete(url, headers=headers, timeout=30)
-
+            r = requests.post(url, json=body, headers=headers, timeout=30)
             if r.status_code == 429:
-                reset = int(r.headers.get("x-rate-limit-reset", time.time() + 60))
-                wait = max(reset - time.time(), 1) + 5
-                print(f"\n  Rate limited on delete — sleeping {wait:.0f}s…\n", flush=True)
-                time.sleep(wait)
-                batch_count = 0
-                window_start = time.time()
-                # retry same tweet
-                r = requests.delete(url, headers=headers, timeout=30)
+                print("  Rate limited — pausing 16 min…", flush=True)
+                time.sleep(16 * 60)
+                r = requests.post(url, json=body, headers=headers, timeout=30)
 
-            if r.status_code in (200, 204):
+            if r.ok:
                 deleted += 1
-                print(f"  [{i}/{total}] Deleted {tweet_id}  (total deleted: {deleted})", flush=True)
+                pct = int(deleted / total * 100)
+                print(f"  [{pct}%] Deleted {deleted}/{total}", flush=True)
             else:
                 failed += 1
-                print(f"  [{i}/{total}] FAILED  {tweet_id} — {r.status_code}: {r.text[:80]}", flush=True)
-
-        except requests.RequestException as e:
+                print(f"  FAILED tweet {tid}: {r.status_code}", flush=True)
+        except Exception as e:
             failed += 1
-            print(f"  [{i}/{total}] ERROR   {tweet_id} — {e}", flush=True)
+            print(f"  ERROR tweet {tid}: {e}", flush=True)
 
-        time.sleep(DELETE_BATCH_SLEEP)
+        time.sleep(DELAY_BETWEEN)
 
-    print(f"\nDone. Deleted: {deleted}  Failed: {failed}  Total: {total}")
+    print(f"\nAll done!  Deleted: {deleted}  Failed: {failed}  Total: {total}")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Shared request headers ────────────────────────────────────────────────────
+def _headers(tokens: dict) -> dict:
+    return {
+        "authorization":   "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+        "x-csrf-token":    tokens["ct0"],
+        "cookie":          f"auth_token={tokens['auth_token']}; ct0={tokens['ct0']}",
+        "x-twitter-auth-type":             "OAuth2Session",
+        "x-twitter-client-language":       "en",
+        "x-twitter-active-user":           "yes",
+        "content-type":    "application/json",
+    }
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Bulk-delete all your tweets.")
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="List tweets that would be deleted without actually deleting them."
-    )
-    args = parser.parse_args()
+    print("=" * 50)
+    print("   Twitter Bulk Delete")
+    print("=" * 50)
+    print()
+    username = input("Twitter username (without @): ").strip()
+    password = getpass.getpass("Password (hidden as you type): ")
+    print()
 
-    creds = get_creds()
+    tokens   = get_tokens(username, password)
+    user_id  = get_user_id(username, tokens)
+    ids      = fetch_all_ids(user_id, tokens)
 
-    print("Authenticating…")
-    user_id, username = get_user_id(creds)
-    print(f"Logged in as @{username} (id: {user_id})\n")
-
-    tweet_ids = fetch_tweet_ids(user_id, creds)
-    print(f"\nFound {len(tweet_ids)} tweet(s) total.\n")
-
-    if not tweet_ids:
-        print("Nothing to do — your timeline is already empty.")
+    print(f"\nFound {len(ids)} tweet(s).")
+    if not ids:
+        print("Nothing to delete — you're all clear!")
         return
 
-    if not args.dry_run:
-        confirm = input(
-            f"About to permanently delete ALL {len(tweet_ids)} tweets for @{username}.\n"
-            "Type YES to continue, anything else to abort: "
-        ).strip()
-        if confirm != "YES":
-            print("Aborted.")
-            return
+    confirm = input(f"\nPermanently delete all {len(ids)} tweets? Type YES to confirm: ").strip()
+    if confirm != "YES":
+        print("Cancelled.")
+        return
 
-    delete_tweets(tweet_ids, creds, dry_run=args.dry_run)
+    delete_all(ids, tokens)
 
 
 if __name__ == "__main__":
