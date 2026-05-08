@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Twitter Bulk Delete
-───────────────────
+Twitter Bulk Delete + Unfollow
+──────────────────────────────
 Just run:  python3 twitter_bulk_delete.py
 
 You'll be asked for your username and password.
@@ -34,7 +34,8 @@ import time, json, getpass, re, requests
 # ── Rate limit constants ──────────────────────────────────────────────────────
 DELETE_LIMIT        = 50      # Twitter allows 50 deletes per 15 min
 DELETE_WINDOW       = 15 * 60
-DELAY_BETWEEN       = 1.2    # seconds between each delete
+DELAY_BETWEEN       = 1.2    # seconds between each delete / unfollow
+UNFOLLOW_DAILY_MAX  = 400     # Twitter's safe daily unfollow limit
 
 # ── Step 1: log in via real browser, grab auth tokens ────────────────────────
 def get_tokens(username: str, password: str) -> dict:
@@ -267,6 +268,73 @@ def delete_all(tweet_ids: list[str], tokens: dict):
     print(f"\nAll done!  Deleted: {deleted}  Failed: {failed}  Total: {total}")
 
 
+# ── Step 5: fetch all following IDs ──────────────────────────────────────────
+def fetch_following(user_id: str, tokens: dict) -> list[str]:
+    print("Fetching accounts you follow…")
+    ids = []
+    cursor = -1
+
+    while True:
+        url = "https://api.twitter.com/1.1/friends/ids.json"
+        params = {"user_id": user_id, "count": 5000, "stringify_ids": "true", "cursor": cursor}
+        r = requests.get(url, params=params, headers=_headers(tokens), timeout=30)
+
+        if r.status_code == 429:
+            print("  Pausing for rate limit…")
+            time.sleep(60)
+            continue
+        r.raise_for_status()
+
+        body = r.json()
+        batch = body.get("ids", [])
+        ids.extend(batch)
+        print(f"  Found {len(ids)} so far…", flush=True)
+
+        cursor = body.get("next_cursor", 0)
+        if not cursor:
+            break
+
+    return ids
+
+
+# ── Step 6: unfollow everyone ─────────────────────────────────────────────────
+def unfollow_all(user_ids: list[str], tokens: dict):
+    total     = len(user_ids)
+    unfollowed = 0
+    failed    = 0
+
+    print(f"\nUnfollowing {total} account(s). Don't close the window.\n")
+
+    # Twitter's safe limit is ~400/day; we pace to ~1 every 3.5s to stay well under
+    delay = max(DELAY_BETWEEN, 86400 / UNFOLLOW_DAILY_MAX)
+
+    for i, uid in enumerate(user_ids, 1):
+        url  = "https://api.twitter.com/1.1/friendships/destroy.json"
+        headers = {**_headers(tokens), "Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            r = requests.post(url, data={"user_id": uid}, headers=headers, timeout=30)
+
+            if r.status_code == 429:
+                print("  Rate limited — pausing 16 min…", flush=True)
+                time.sleep(16 * 60)
+                r = requests.post(url, data={"user_id": uid}, headers=headers, timeout=30)
+
+            if r.ok:
+                unfollowed += 1
+                pct = int(unfollowed / total * 100)
+                print(f"  [{pct}%] Unfollowed {unfollowed}/{total}", flush=True)
+            else:
+                failed += 1
+                print(f"  FAILED uid {uid}: {r.status_code}", flush=True)
+        except Exception as e:
+            failed += 1
+            print(f"  ERROR uid {uid}: {e}", flush=True)
+
+        time.sleep(delay)
+
+    print(f"\nDone unfollowing!  Unfollowed: {unfollowed}  Failed: {failed}  Total: {total}")
+
+
 # ── Shared request headers ────────────────────────────────────────────────────
 def _headers(tokens: dict) -> dict:
     return {
@@ -283,28 +351,48 @@ def _headers(tokens: dict) -> dict:
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("=" * 50)
-    print("   Twitter Bulk Delete")
+    print("   Twitter Bulk Delete + Unfollow")
     print("=" * 50)
     print()
     username = input("Twitter username (without @): ").strip()
     password = getpass.getpass("Password (hidden as you type): ")
     print()
 
-    tokens   = get_tokens(username, password)
-    user_id  = get_user_id(username, tokens)
-    ids      = fetch_all_ids(user_id, tokens)
+    tokens  = get_tokens(username, password)
+    user_id = get_user_id(username, tokens)
 
-    print(f"\nFound {len(ids)} tweet(s).")
-    if not ids:
-        print("Nothing to delete — you're all clear!")
+    # ── Tweets ────────────────────────────────────────────────────────────────
+    tweet_ids = fetch_all_ids(user_id, tokens)
+    print(f"\nFound {len(tweet_ids)} tweet(s).")
+
+    do_tweets = False
+    if tweet_ids:
+        ans = input(f"Permanently delete all {len(tweet_ids)} tweets? Type YES to confirm: ").strip()
+        do_tweets = (ans == "YES")
+        if not do_tweets:
+            print("Skipping tweet deletion.")
+
+    # ── Following ─────────────────────────────────────────────────────────────
+    following_ids = fetch_following(user_id, tokens)
+    print(f"\nFound {len(following_ids)} account(s) you follow.")
+
+    do_unfollow = False
+    if following_ids:
+        ans = input(f"Unfollow all {len(following_ids)} accounts? Type YES to confirm: ").strip()
+        do_unfollow = (ans == "YES")
+        if not do_unfollow:
+            print("Skipping unfollow.")
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+    if not do_tweets and not do_unfollow:
+        print("\nNothing to do — exiting.")
         return
 
-    confirm = input(f"\nPermanently delete all {len(ids)} tweets? Type YES to confirm: ").strip()
-    if confirm != "YES":
-        print("Cancelled.")
-        return
+    if do_tweets:
+        delete_all(tweet_ids, tokens)
 
-    delete_all(ids, tokens)
+    if do_unfollow:
+        unfollow_all(following_ids, tokens)
 
 
 if __name__ == "__main__":
