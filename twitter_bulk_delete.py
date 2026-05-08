@@ -20,7 +20,7 @@ def install(pkg, import_as=None):
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
 install("playwright")
-install("getpass")  # stdlib, but harmless
+install("requests")
 
 # Install playwright browsers if needed
 try:
