@@ -38,71 +38,24 @@ DELAY_BETWEEN       = 1.2    # seconds between each delete / unfollow
 UNFOLLOW_DAILY_MAX  = 400     # Twitter's safe daily unfollow limit
 
 # ── Step 1: log in via real browser, grab auth tokens ────────────────────────
-def get_tokens(username: str, password: str) -> dict:
-    print("\nOpening browser to log in…")
+def get_tokens(username: str, password) -> dict:
+    print("\nOpening browser — please log in manually in the window that appears.")
+    print("The script will continue automatically once you're logged in.\n")
     tokens = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=150)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
 
-        page.goto("https://x.com/i/flow/login", wait_until="networkidle", timeout=60000)
-        time.sleep(3)
+        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=60000)
 
-        # Username — try multiple selectors
-        for sel in [
-            'input[autocomplete="username"]',
-            'input[name="text"]',
-            'input[data-testid="ocfEnterTextTextInput"]',
-        ]:
-            field = page.query_selector(sel)
-            if field:
-                field.fill(username)
-                break
-        else:
-            print("Could not find username field. Check the browser window.")
+        # Wait until the URL changes to the home feed (meaning login succeeded)
+        print("Waiting for you to log in…", flush=True)
+        page.wait_for_url("**/home", timeout=300000)  # 5 min to log in
+        time.sleep(2)
 
-        # Click Next
-        for label in ["Next", "next"]:
-            btn = page.query_selector(f'[role="button"]:has-text("{label}")')
-            if btn:
-                btn.click()
-                break
-        time.sleep(3)
-
-        # Sometimes Twitter asks for email/phone verification
-        unusual = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
-        if unusual:
-            print("\nTwitter is asking for your email or phone number as a check.")
-            extra = input("Enter it here: ").strip()
-            unusual.fill(extra)
-            page.query_selector('[role="button"]:has-text("Next")').click()
-            time.sleep(3)
-
-        # Password
-        pwd_field = page.query_selector('input[type="password"]')
-        if pwd_field:
-            pwd_field.fill(password)
-        time.sleep(1)
-
-        # Click Log in
-        for label in ["Log in", "Login", "Sign in"]:
-            btn = page.query_selector(f'[role="button"]:has-text("{label}")')
-            if btn:
-                btn.click()
-                break
-        time.sleep(5)
-
-        # Handle 2FA if present
-        tfa = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
-        if tfa:
-            code = input("\n2FA code (check your authenticator app or SMS): ").strip()
-            tfa.fill(code)
-            page.query_selector('[role="button"]:has-text("Next")').click()
-            time.sleep(3)
-
-        # Extract cookies for API calls
+        # Extract cookies
         cookies = context.cookies()
         for c in cookies:
             if c["name"] == "auth_token":
@@ -113,7 +66,7 @@ def get_tokens(username: str, password: str) -> dict:
         browser.close()
 
     if not tokens.get("auth_token"):
-        print("\nCould not log in. Check your username/password and try again.")
+        print("\nCould not get login token. Please try again.")
         sys.exit(1)
 
     print("Logged in successfully.\n")
@@ -387,10 +340,9 @@ def main():
     print("=" * 50)
     print()
     username = input("Twitter username (without @): ").strip()
-    password = getpass.getpass("Password (hidden as you type): ")
     print()
 
-    tokens  = get_tokens(username, password)
+    tokens  = get_tokens(username, None)
     user_id = get_user_id(username, tokens)
 
     # ── Tweets ────────────────────────────────────────────────────────────────
