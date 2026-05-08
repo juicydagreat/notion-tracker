@@ -43,17 +43,33 @@ def get_tokens(username: str, password: str) -> dict:
     tokens = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=100)
+        browser = p.chromium.launch(headless=False, slow_mo=150)
         context = browser.new_context()
         page = context.new_page()
 
-        page.goto("https://twitter.com/i/flow/login", wait_until="domcontentloaded")
-        time.sleep(2)
+        page.goto("https://x.com/i/flow/login", wait_until="networkidle", timeout=60000)
+        time.sleep(3)
 
-        # Username
-        page.get_by_label("Phone, email, or username").fill(username)
-        page.get_by_role("button", name="Next").click()
-        time.sleep(2)
+        # Username — try multiple selectors
+        for sel in [
+            'input[autocomplete="username"]',
+            'input[name="text"]',
+            'input[data-testid="ocfEnterTextTextInput"]',
+        ]:
+            field = page.query_selector(sel)
+            if field:
+                field.fill(username)
+                break
+        else:
+            print("Could not find username field. Check the browser window.")
+
+        # Click Next
+        for label in ["Next", "next"]:
+            btn = page.query_selector(f'[role="button"]:has-text("{label}")')
+            if btn:
+                btn.click()
+                break
+        time.sleep(3)
 
         # Sometimes Twitter asks for email/phone verification
         unusual = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
@@ -61,24 +77,29 @@ def get_tokens(username: str, password: str) -> dict:
             print("\nTwitter is asking for your email or phone number as a check.")
             extra = input("Enter it here: ").strip()
             unusual.fill(extra)
-            page.get_by_role("button", name="Next").click()
-            time.sleep(2)
+            page.query_selector('[role="button"]:has-text("Next")').click()
+            time.sleep(3)
 
         # Password
         pwd_field = page.query_selector('input[type="password"]')
-        if not pwd_field:
-            page.get_by_label("Password").fill(password)
-        else:
+        if pwd_field:
             pwd_field.fill(password)
-        page.get_by_role("button", name="Log in").click()
-        time.sleep(4)
+        time.sleep(1)
+
+        # Click Log in
+        for label in ["Log in", "Login", "Sign in"]:
+            btn = page.query_selector(f'[role="button"]:has-text("{label}")')
+            if btn:
+                btn.click()
+                break
+        time.sleep(5)
 
         # Handle 2FA if present
         tfa = page.query_selector('input[data-testid="ocfEnterTextTextInput"]')
         if tfa:
             code = input("\n2FA code (check your authenticator app or SMS): ").strip()
             tfa.fill(code)
-            page.get_by_role("button", name="Next").click()
+            page.query_selector('[role="button"]:has-text("Next")').click()
             time.sleep(3)
 
         # Extract cookies for API calls
