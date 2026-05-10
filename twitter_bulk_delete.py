@@ -39,21 +39,21 @@ UNFOLLOW_DAILY_MAX  = 400     # Twitter's safe daily unfollow limit
 
 # ── Step 1: log in via real browser, grab auth tokens ────────────────────────
 def get_tokens(username: str, password) -> dict:
-    print("\nOpening browser — please log in manually in the window that appears.")
-    print("The script will continue automatically once you're logged in.\n")
+    print("\nOpening browser — log in normally in the window that appears.")
     tokens = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
+        page.goto("https://x.com/login", wait_until="domcontentloaded", timeout=60000)
 
-        page.goto("https://x.com/i/flow/login", wait_until="domcontentloaded", timeout=60000)
-
-        # Wait until the URL changes to the home feed (meaning login succeeded)
-        print("Waiting for you to log in…", flush=True)
-        page.wait_for_url("**/home", timeout=300000)  # 5 min to log in
-        time.sleep(2)
+        input("\nLog into X/Twitter in the browser, then come back here and press Enter…")
 
         # Extract cookies
         cookies = context.cookies()
@@ -66,7 +66,7 @@ def get_tokens(username: str, password) -> dict:
         browser.close()
 
     if not tokens.get("auth_token"):
-        print("\nCould not get login token. Please try again.")
+        print("\nCould not get login token — make sure you're fully logged in before pressing Enter.")
         sys.exit(1)
 
     print("Logged in successfully.\n")
