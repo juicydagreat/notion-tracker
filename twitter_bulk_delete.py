@@ -39,38 +39,26 @@ UNFOLLOW_DAILY_MAX  = 400     # Twitter's safe daily unfollow limit
 
 # ── Step 1: log in via real browser, grab auth tokens ────────────────────────
 def get_tokens(username: str, password) -> dict:
-    print("\nOpening browser — log in normally in the window that appears.")
-    tokens = {}
+    print("""
+To get your login token, follow these steps:
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-        page.goto("https://x.com/login", wait_until="domcontentloaded", timeout=60000)
+  1. Open Chrome and go to x.com — log in if needed
+  2. Press F12 to open Developer Tools
+  3. Click the "Application" tab at the top
+  4. On the left, expand "Cookies" then click "https://x.com"
+  5. Find the row named  auth_token  and copy its value
+  6. Find the row named  ct0         and copy its value
 
-        input("\nLog into X/Twitter in the browser, then come back here and press Enter…")
+""")
+    auth_token = input("Paste your auth_token here: ").strip()
+    ct0        = input("Paste your ct0 here:        ").strip()
 
-        # Extract cookies
-        cookies = context.cookies()
-        for c in cookies:
-            if c["name"] == "auth_token":
-                tokens["auth_token"] = c["value"]
-            if c["name"] == "ct0":
-                tokens["ct0"] = c["value"]
-
-        browser.close()
-
-    if not tokens.get("auth_token"):
-        print("\nCould not get login token — make sure you're fully logged in before pressing Enter.")
+    if not auth_token or not ct0:
+        print("Both values are required. Please try again.")
         sys.exit(1)
 
-    print("Logged in successfully.\n")
-    return tokens
+    print("\nGot it — continuing...\n")
+    return {"auth_token": auth_token, "ct0": ct0}
 
 
 # ── Step 2: get the numeric user ID ──────────────────────────────────────────
