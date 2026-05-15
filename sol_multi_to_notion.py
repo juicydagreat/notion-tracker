@@ -251,13 +251,18 @@ def notion_query_paginated(db_id, body):
 
 
 def get_prev_perwallet_rows(today):
-    rows = notion_query_paginated(NOTION_DB_PERWALLET, {
-        "filter": {"property": "Date", "date": {"before": today}},
-        "sorts":  [{"property": "Date", "direction": "descending"}],
-        "page_size": 100,
-    })
+    # One page of 100 (Notion max) sorted descending covers all 94 wallets' most recent entries
+    # without paginating through all historical data, which causes timeouts as the DB grows.
+    res = notion_req(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_PERWALLET}/query",
+        {
+            "filter": {"property": "Date", "date": {"before": today}},
+            "sorts":  [{"property": "Date", "direction": "descending"}],
+            "page_size": 100,
+        },
+    )
     lookup = {}
-    for page in rows:
+    for page in res.get("results", []):
         try:
             w = page["properties"][TITLE_PROP]["title"][0]["plain_text"]
             if w not in lookup:
