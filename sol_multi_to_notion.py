@@ -32,6 +32,8 @@ NOTION_VERSION       = "2022-06-28"
 RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",       "30"))
 RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
+NOTION_TIMEOUT   = int(os.environ.get("NOTION_TIMEOUT",    "60"))
+NOTION_RETRIES   = int(os.environ.get("NOTION_RETRIES",    "4"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "10"))
 BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",      "2.0"))
 INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
@@ -221,20 +223,28 @@ def notion_headers():
 
 
 def notion_req(url, body, method="POST"):
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers=notion_headers(),
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
-            if isinstance(data, dict) and data.get("object") == "error":
-                raise Exception(f"Notion error: {data}")
-            return data
-    except urllib.error.HTTPError as e:
-        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+    last_err = None
+    for attempt in range(1, NOTION_RETRIES + 1):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers=notion_headers(),
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=NOTION_TIMEOUT) as r:
+                data = json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+                if isinstance(data, dict) and data.get("object") == "error":
+                    raise Exception(f"Notion error: {data}")
+                return data
+        except urllib.error.HTTPError as e:
+            raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+        except (TimeoutError, OSError) as e:
+            last_err = e
+            wait = min(2 ** attempt, 30)
+            log(f"  [notion] transient error (attempt {attempt}/{NOTION_RETRIES}): {e}. Retrying in {wait}s…")
+            time.sleep(wait)
+    raise Exception(f"Notion request failed after {NOTION_RETRIES} attempts: {last_err}")
 
 
 def notion_query_paginated(db_id, body):
