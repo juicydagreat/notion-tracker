@@ -34,6 +34,7 @@ RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
 NOTION_TIMEOUT   = int(os.environ.get("NOTION_TIMEOUT",    "60"))
 NOTION_RETRIES   = int(os.environ.get("NOTION_RETRIES",    "4"))
+NOTION_WRITE_DELAY = float(os.environ.get("NOTION_WRITE_DELAY", "0.35"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "10"))
 BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",      "2.0"))
 INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
@@ -238,7 +239,14 @@ def notion_req(url, body, method="POST"):
                     raise Exception(f"Notion error: {data}")
                 return data
         except urllib.error.HTTPError as e:
-            raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+            body_text = e.read().decode()
+            if e.code == 429:
+                wait = min(2 ** attempt, 60)
+                log(f"  [notion] rate limited (attempt {attempt}/{NOTION_RETRIES}), retrying in {wait}s…")
+                last_err = Exception(f"Notion HTTP 429: {body_text}")
+                time.sleep(wait)
+                continue
+            raise Exception(f"Notion HTTP {e.code}: {body_text}")
         except (TimeoutError, OSError) as e:
             last_err = e
             wait = min(2 ** attempt, 30)
@@ -354,6 +362,7 @@ def main():
             "USDC End Balance": {"number": usdc},
             "USDC Delta":       {"number": d_usdc},
         })
+        time.sleep(NOTION_WRITE_DELAY)
 
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
