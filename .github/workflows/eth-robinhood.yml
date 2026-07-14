@@ -46,10 +46,10 @@ jobs:
           # Robinhood Chain mainnet (chain id 4663), native gas token = ETH
           RH_PRIMARY_RPC:        "https://rpc.mainnet.chain.robinhood.com"
           RH_FALLBACK_RPC:       ""
-          # Stablecoin column — Global Dollar (USDG) by default. Override via secrets if desired.
-          STABLE_CONTRACT:       "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+          # Stablecoin column — Tether USD (USDT) on Robinhood Chain. Override via secrets if desired.
+          STABLE_CONTRACT:       "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380"
           STABLE_DECIMALS:       "6"
-          STABLE_SYMBOL:         "USDG"
+          STABLE_SYMBOL:         "USDT"
           # Tuning
           BATCH_SIZE:            "10"
           BATCH_PAUSE:           "1.0"

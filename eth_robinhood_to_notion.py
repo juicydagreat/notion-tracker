@@ -6,14 +6,14 @@ Zero external dependencies — pure Python stdlib.
 Mirrors sol_multi_to_notion.py but reads native ETH balances on
 Robinhood Chain (an Ethereum Layer-2, chain id 4663) instead of SOL on
 Solana. Optionally also tracks an ERC-20 stablecoin (defaults to
-Global Dollar / USDG, the Robinhood-ecosystem stablecoin).
+Tether USD / USDT on Robinhood Chain).
 
 All wallet addresses are masked in logs (0x1234...abcd) so this script
 is safe to run on a public GitHub repository.
 
 Writes to the SAME Notion databases as the SOL tracker:
   End Balance / Delta           <- native ETH
-  USDC End Balance / USDC Delta <- stablecoin (USDG by default)
+  USDC End Balance / USDC Delta <- stablecoin (USDT by default)
 
 Required secrets:
   NOTION_TOKEN, NOTION_DB_PERWALLET, NOTION_DB_DAILYTOTAL,
@@ -41,10 +41,10 @@ WALLETS_CSV          = os.environ["ETH_WALLETS_CSV"]
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
 
-# Stablecoin (ERC-20) — defaults to Global Dollar (USDG) on Robinhood Chain.
-STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168").strip()
+# Stablecoin (ERC-20) — defaults to Tether USD (USDT) on Robinhood Chain.
+STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380").strip()
 STABLE_DECIMALS = int(os.environ.get("STABLE_DECIMALS", "6"))
-STABLE_SYMBOL   = os.environ.get("STABLE_SYMBOL", "USDG").strip()
+STABLE_SYMBOL   = os.environ.get("STABLE_SYMBOL", "USDT").strip()
 
 RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",       "30"))
 RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))

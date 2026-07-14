@@ -17,9 +17,9 @@ RPC_BACKOFF_CAP = float(os.environ.get("RPC_BACKOFF_CAP", "30"))
 CALL_DELAY      = float(os.environ.get("CALL_DELAY",      "0.5"))
 USER_AGENT      = os.environ.get("RPC_USER_AGENT", "notion-tracker/1.0 (+https://github.com)").strip()
 
-STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168").strip()
+STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380").strip()
 STABLE_DECIMALS = int(os.environ.get("STABLE_DECIMALS", "6"))
-STABLE_SYMBOL   = os.environ.get("STABLE_SYMBOL", "USDG").strip()
+STABLE_SYMBOL   = os.environ.get("STABLE_SYMBOL", "USDT").strip()
 
 ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
 WEI_PER_ETH = 10 ** 18
