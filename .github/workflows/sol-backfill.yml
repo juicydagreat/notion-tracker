@@ -1,0 +1,38 @@
+name: Solana AUD Backfill (one-time)
+
+# Manual only. Fills 'Price AUD' and 'AUD Delta' on existing Solana rows
+# using historical prices. Safe to re-run (skips rows already filled unless
+# force=true).
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Overwrite rows that already have an AUD Delta"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run backfill
+        env:
+          NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
+          NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          PRICE_COIN_ID:         "solana"
+          COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
+          FORCE:                 ${{ inputs.force }}
+        run: python backfill_sol_aud.py

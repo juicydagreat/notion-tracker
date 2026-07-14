@@ -33,6 +33,8 @@ import os, sys, json, time, random, re
 import urllib.request, urllib.error
 from datetime import datetime, timezone
 
+import aud_prices
+
 # ── Config ──────────────────────────────────────────────────────────────────────────────
 NOTION_TOKEN         = os.environ["NOTION_TOKEN"].strip()
 NOTION_DB_PERWALLET  = os.environ["NOTION_DB_PERWALLET"].strip()
@@ -40,6 +42,11 @@ NOTION_DB_DAILYTOTAL = os.environ["NOTION_DB_DAILYTOTAL"].strip()
 WALLETS_CSV          = os.environ["ETH_WALLETS_CSV"]
 TITLE_PROP           = os.environ.get("TITLE_PROP_PERWALLET", "Wallet").strip()
 NOTION_VERSION       = "2022-06-28"
+
+# AUD price columns. PRICE_COIN_ID is the CoinGecko id of the native asset.
+PRICE_COIN_ID   = os.environ.get("PRICE_COIN_ID", "ethereum").strip()
+PRICE_PROP      = os.environ.get("PRICE_PROP", "Price AUD").strip()
+AUD_DELTA_PROP  = os.environ.get("AUD_DELTA_PROP", "AUD Delta").strip()
 
 # Stablecoin (ERC-20) — defaults to Tether USD (USDT) on Robinhood Chain.
 STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380").strip()
@@ -239,6 +246,27 @@ def notion_req(url, body, method="POST"):
         raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
 
 
+def notion_get(url):
+    req = urllib.request.Request(url, headers=notion_headers(), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace") or "{}")
+    except urllib.error.HTTPError as e:
+        raise Exception(f"Notion HTTP {e.code}: {e.read().decode()}")
+
+
+def ensure_number_props(db_id, names, number_format="australian_dollar"):
+    """Create any missing number properties on a database (idempotent)."""
+    db = notion_get(f"https://api.notion.com/v1/databases/{db_id}")
+    existing = set(db.get("properties", {}).keys())
+    missing = [n for n in names if n not in existing]
+    if not missing:
+        return
+    log(f"  Adding Notion columns to {db_id[:8]}...: {missing}")
+    props = {n: {"number": {"format": number_format}} for n in missing}
+    notion_req(f"https://api.notion.com/v1/databases/{db_id}", {"properties": props}, method="PATCH")
+
+
 def notion_query_paginated(db_id, body):
     rows, cursor = [], None
     while True:
@@ -324,12 +352,23 @@ def main():
     total_stable = r2(sum(stable_list))
     log(f"Total {STABLE_SYMBOL}: {total_stable}")
 
-    log(f"\nSummary: Total ETH={total_eth}  Total {STABLE_SYMBOL}={total_stable}")
+    log(f"\n--- Fetching ETH price (AUD) ---")
+    eth_price = r2(aud_prices.spot_aud([PRICE_COIN_ID]).get(PRICE_COIN_ID))
+    log(f"  ETH price: {eth_price} AUD")
+
+    log(f"\nSummary: Total ETH={total_eth}  Total {STABLE_SYMBOL}={total_stable}  ETH/AUD={eth_price}")
+
+    log(f"\n--- Ensuring Notion AUD columns exist ---")
+    ensure_number_props(NOTION_DB_PERWALLET,  [PRICE_PROP, AUD_DELTA_PROP])
+    ensure_number_props(NOTION_DB_DAILYTOTAL, [PRICE_PROP, AUD_DELTA_PROP])
 
     log(f"\n--- Fetching previous Notion rows ---")
     prev_lookup = get_prev_perwallet_rows(today)
     prev_total  = get_prev_total_row(today)
     log(f"  {len(prev_lookup)} previous per-wallet rows found")
+
+    def aud_delta(delta):
+        return r2(delta * eth_price) if (delta is not None and eth_price is not None) else None
 
     log(f"\n--- Writing {len(wallets)} per-wallet rows to Notion ---")
     for i, (w, eth, stable) in enumerate(zip(wallets, eth_list, stable_list), 1):
@@ -338,7 +377,8 @@ def main():
         prev     = prev_lookup.get(w)
         d_eth    = r6(eth    - get_num(prev, "End Balance"))      if prev else None
         d_stable = r2(stable - get_num(prev, "USDC End Balance")) if prev else None
-        log(f"  [{i:02d}/{len(wallets)}] {mask(w)}  ETH={eth} Δ{d_eth}  {STABLE_SYMBOL}={stable} Δ{d_stable}")
+        d_aud    = aud_delta(d_eth)
+        log(f"  [{i:02d}/{len(wallets)}] {mask(w)}  ETH={eth} Δ{d_eth}  {STABLE_SYMBOL}={stable} Δ{d_stable}  AUDΔ{d_aud}")
         create_page(NOTION_DB_PERWALLET, {
             TITLE_PROP:         {"title": [{"text": {"content": w}}]},
             "Date":             {"date":  {"start": today}},
@@ -346,6 +386,8 @@ def main():
             "Delta":            {"number": d_eth},
             "USDC End Balance": {"number": stable},
             "USDC Delta":       {"number": d_stable},
+            PRICE_PROP:         {"number": eth_price},
+            AUD_DELTA_PROP:     {"number": d_aud},
         })
 
     log(f"\n--- Writing daily total row ---")
@@ -353,7 +395,8 @@ def main():
     p_stable_t = get_num(prev_total, "USDC End Balance")
     d_eth_t    = r6(total_eth    - p_eth_t)    if prev_total else None
     d_stable_t = r2(total_stable - p_stable_t) if prev_total else None
-    log(f"  ETH={total_eth} Δ{d_eth_t}  {STABLE_SYMBOL}={total_stable} Δ{d_stable_t}")
+    d_aud_t    = aud_delta(d_eth_t)
+    log(f"  ETH={total_eth} Δ{d_eth_t}  {STABLE_SYMBOL}={total_stable} Δ{d_stable_t}  AUDΔ{d_aud_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
         "Name":             {"title": [{"text": {"content": f"{total_eth:.4f} ETH"}}]},
         "Date":             {"date":  {"start": today}},
@@ -361,6 +404,8 @@ def main():
         "Delta":            {"number": d_eth_t},
         "USDC End Balance": {"number": total_stable},
         "USDC Delta":       {"number": d_stable_t},
+        PRICE_PROP:         {"number": eth_price},
+        AUD_DELTA_PROP:     {"number": d_aud_t},
     })
     log("\nDone.")
 

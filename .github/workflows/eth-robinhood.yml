@@ -43,6 +43,9 @@ jobs:
           NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
           ETH_WALLETS_CSV:       ${{ secrets.ETH_WALLETS_CSV }}
           TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
+          # AUD price (CoinGecko). Key is optional — free tier works without it.
+          PRICE_COIN_ID:         "ethereum"
+          COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
           # Robinhood Chain mainnet (chain id 4663), native gas token = ETH
           RH_PRIMARY_RPC:        "https://rpc.mainnet.chain.robinhood.com"
           RH_FALLBACK_RPC:       ""

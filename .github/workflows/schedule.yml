@@ -45,6 +45,9 @@ jobs:
           USDC_MINT:             ${{ secrets.USDC_MINT }}
           USDC_WALLET:           ${{ secrets.USDC_WALLET }}
           TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
+          # AUD price (CoinGecko). Key is optional — free tier works without it.
+          PRICE_COIN_ID:         "solana"
+          COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
