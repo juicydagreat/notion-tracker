@@ -1,8 +1,8 @@
-name: Solana Notion Tracker
+name: Robinhood Chain Notion Tracker
 
 on:
   schedule:
-    - cron: "0 17 * * *"   # 5 PM UTC daily
+    - cron: "30 17 * * *"   # 5:30 PM UTC daily (offset from the SOL tracker at 17:00)
   workflow_dispatch:
     inputs:
       mode:
@@ -31,9 +31,9 @@ jobs:
         id: choose
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.mode }}" = "production" ]; then
-            echo "script=sol_multi_to_notion.py" >> $GITHUB_OUTPUT
+            echo "script=eth_robinhood_to_notion.py" >> $GITHUB_OUTPUT
           else
-            echo "script=sol_diagnostic.py" >> $GITHUB_OUTPUT
+            echo "script=eth_diagnostic.py" >> $GITHUB_OUTPUT
           fi
 
       - name: Run script
@@ -41,22 +41,22 @@ jobs:
           NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
           NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          WALLETS_CSV:           ${{ secrets.WALLETS_CSV }}
-          USDC_MINT:             ${{ secrets.USDC_MINT }}
-          USDC_WALLET:           ${{ secrets.USDC_WALLET }}
+          ETH_WALLETS_CSV:       ${{ secrets.ETH_WALLETS_CSV }}
           TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
           # AUD price (CoinGecko). Key is optional — free tier works without it.
-          PRICE_COIN_ID:         "solana"
+          PRICE_COIN_ID:         "ethereum"
           COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
-          # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
-          SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
-          SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
-          # Individual call fallback — mainnet-beta handles sequential calls fine
-          INDIVIDUAL_RPC:        "https://api.mainnet-beta.solana.com"
-          INDIVIDUAL_DELAY:      "2.0"
-          # Batch tuning (only used if batch succeeds)
+          # Robinhood Chain mainnet (chain id 4663), native gas token = ETH
+          RH_PRIMARY_RPC:        "https://rpc.mainnet.chain.robinhood.com"
+          RH_FALLBACK_RPC:       ""
+          # Stablecoin column — Tether USD (USDT) on Robinhood Chain. Override via secrets if desired.
+          STABLE_CONTRACT:       "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380"
+          STABLE_DECIMALS:       "6"
+          STABLE_SYMBOL:         "USDT"
+          # Tuning
           BATCH_SIZE:            "10"
-          BATCH_PAUSE:           "2.0"
+          BATCH_PAUSE:           "1.0"
+          CALL_DELAY:            "0.5"
           RPC_TIMEOUT:           "30"
           RPC_RETRIES:           "5"
           RPC_BACKOFF_CAP:       "30"
