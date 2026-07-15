@@ -36,6 +36,13 @@ PRICE_COIN_ID   = os.environ.get("PRICE_COIN_ID", "solana").strip()
 PRICE_PROP      = os.environ.get("PRICE_PROP", "Price AUD").strip()
 AUD_DELTA_PROP  = os.environ.get("AUD_DELTA_PROP", "AUD Delta").strip()
 
+# The daily-total DB is shared with other trackers (e.g. ETH on Robinhood
+# Chain). ASSET_LABEL isolates this tracker's rows so the day-over-day delta
+# is computed against the previous SOL row only — not an ETH row or a manual
+# note. Must appear in the daily-total row title (see create_page below).
+ASSET_LABEL          = os.environ.get("ASSET_LABEL", "SOL").strip()
+DAILYTOTAL_TITLE     = os.environ.get("TITLE_PROP_DAILYTOTAL", "Name").strip()
+
 RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",       "30"))
 RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
@@ -299,7 +306,10 @@ def get_prev_total_row(today):
     res = notion_req(
         f"https://api.notion.com/v1/databases/{NOTION_DB_DAILYTOTAL}/query",
         {
-            "filter": {"property": "Date", "date": {"before": today}},
+            "filter": {"and": [
+                {"property": "Date", "date": {"before": today}},
+                {"property": DAILYTOTAL_TITLE, "title": {"contains": ASSET_LABEL}},
+            ]},
             "sorts":  [{"property": "Date", "direction": "descending"}],
             "page_size": 1,
         },
@@ -395,7 +405,7 @@ def main():
     d_aud_t  = aud_delta(d_sol_t)
     log(f"  SOL={total_sol} \u0394{d_sol_t}  USDC={usdc_total} \u0394{d_usdc_t}  AUD\u0394{d_aud_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
-        "Name":             {"title": [{"text": {"content": f"{total_sol:.2f} SOL"}}]},
+        DAILYTOTAL_TITLE:   {"title": [{"text": {"content": f"{total_sol:.2f} {ASSET_LABEL}"}}]},
         "Date":             {"date":  {"start": today}},
         "End Balance":      {"number": total_sol},
         "Delta":            {"number": d_sol_t},
