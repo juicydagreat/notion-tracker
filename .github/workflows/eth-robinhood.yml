@@ -46,6 +46,9 @@ jobs:
           # AUD price (CoinGecko). Key is optional — free tier works without it.
           PRICE_COIN_ID:         "ethereum"
           COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
+          # Isolates this tracker's rows in the shared daily-total DB so deltas
+          # compare ETH-to-ETH only (not SOL rows or manual notes).
+          ASSET_LABEL:           "ETH"
           # Robinhood Chain mainnet (chain id 4663), native gas token = ETH
           RH_PRIMARY_RPC:        "https://rpc.mainnet.chain.robinhood.com"
           RH_FALLBACK_RPC:       ""

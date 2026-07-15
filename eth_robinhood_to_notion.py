@@ -48,6 +48,12 @@ PRICE_COIN_ID   = os.environ.get("PRICE_COIN_ID", "ethereum").strip()
 PRICE_PROP      = os.environ.get("PRICE_PROP", "Price AUD").strip()
 AUD_DELTA_PROP  = os.environ.get("AUD_DELTA_PROP", "AUD Delta").strip()
 
+# The daily-total DB is shared with the SOL tracker. ASSET_LABEL isolates
+# this tracker's rows so the day-over-day delta is computed against the
+# previous ETH row only. Must appear in the daily-total row title.
+ASSET_LABEL          = os.environ.get("ASSET_LABEL", "ETH").strip()
+DAILYTOTAL_TITLE     = os.environ.get("TITLE_PROP_DAILYTOTAL", "Name").strip()
+
 # Stablecoin (ERC-20) — defaults to Tether USD (USDT) on Robinhood Chain.
 STABLE_CONTRACT = os.environ.get("STABLE_CONTRACT", "0xE246BC49b0598d7Cd9f0eAD48B885034f1254380").strip()
 STABLE_DECIMALS = int(os.environ.get("STABLE_DECIMALS", "6"))
@@ -301,7 +307,10 @@ def get_prev_total_row(today):
     res = notion_req(
         f"https://api.notion.com/v1/databases/{NOTION_DB_DAILYTOTAL}/query",
         {
-            "filter": {"property": "Date", "date": {"before": today}},
+            "filter": {"and": [
+                {"property": "Date", "date": {"before": today}},
+                {"property": DAILYTOTAL_TITLE, "title": {"contains": ASSET_LABEL}},
+            ]},
             "sorts":  [{"property": "Date", "direction": "descending"}],
             "page_size": 1,
         },
@@ -398,7 +407,7 @@ def main():
     d_aud_t    = aud_delta(d_eth_t)
     log(f"  ETH={total_eth} Δ{d_eth_t}  {STABLE_SYMBOL}={total_stable} Δ{d_stable_t}  AUDΔ{d_aud_t}")
     create_page(NOTION_DB_DAILYTOTAL, {
-        "Name":             {"title": [{"text": {"content": f"{total_eth:.4f} ETH"}}]},
+        DAILYTOTAL_TITLE:   {"title": [{"text": {"content": f"{total_eth:.4f} {ASSET_LABEL}"}}]},
         "Date":             {"date":  {"start": today}},
         "End Balance":      {"number": total_eth},
         "Delta":            {"number": d_eth_t},

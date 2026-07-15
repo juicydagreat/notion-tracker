@@ -48,6 +48,9 @@ jobs:
           # AUD price (CoinGecko). Key is optional — free tier works without it.
           PRICE_COIN_ID:         "solana"
           COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
+          # Isolates this tracker's rows in the shared daily-total DB so deltas
+          # compare SOL-to-SOL only (not ETH rows or manual notes).
+          ASSET_LABEL:           "SOL"
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
