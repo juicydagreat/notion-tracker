@@ -1,0 +1,26 @@
+name: Combined AUD Total
+
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 7 PM UTC — after SOL (17:00) and ETH (17:30)
+  workflow_dispatch:
+
+jobs:
+  total-aud:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write combined AUD total
+        env:
+          NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
+          COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
+          AUD_LABEL:             "AUD"
+        run: python total_aud_to_notion.py
