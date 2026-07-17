@@ -14,6 +14,7 @@ limit and is sent via the x-cg-demo-api-key header.
 """
 import os, json, time, random
 import urllib.request, urllib.error
+from datetime import datetime, timezone
 
 CG_BASE     = os.environ.get("COINGECKO_BASE", "https://api.coingecko.com/api/v3").rstrip("/")
 CG_KEY      = os.environ.get("COINGECKO_API_KEY", "").strip()
@@ -85,6 +86,32 @@ def historical_aud(coin_id, date_iso):
     return price
 
 
+def daily_series_aud(coin_id, days=365):
+    """
+    Bulk daily AUD price history for a coin in ONE call.
+    Returns {date_iso: price} for roughly the last `days` days (free-tier
+    cap is 365). Much cheaper than one historical_aud() call per date.
+    """
+    data = _get(f"/coins/{coin_id}/market_chart",
+                {"vs_currency": "aud", "days": str(days), "interval": "daily"})
+    out = {}
+    for ts, price in data.get("prices", []):
+        d = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date().isoformat()
+        out[d] = price
+    return out
+
+
+def price_on(series, date_iso):
+    """Price for a date from a daily series; falls back to the nearest
+    earlier date if that exact day is missing. None if nothing on/before."""
+    if date_iso in series:
+        return series[date_iso]
+    earlier = [d for d in series if d <= date_iso]
+    return series[max(earlier)] if earlier else None
+
+
 if __name__ == "__main__":
     print("spot:", spot_aud(["solana", "ethereum", "tether", "usd-coin"]))
     print("hist SOL 2026-02-08:", historical_aud("solana", "2026-02-08"))
+    s = daily_series_aud("solana", 365)
+    print("series points:", len(s), "| SOL 2026-02-08:", price_on(s, "2026-02-08"))

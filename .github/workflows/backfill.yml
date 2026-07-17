@@ -1,19 +1,12 @@
-name: Solana AUD Backfill (one-time)
+name: AUD Backfill (all tiles)
 
-# Manual only. Fills 'Price AUD' and 'AUD Delta' on existing Solana rows
-# using historical prices. Safe to re-run (skips rows already filled unless
-# force=true).
+# Manual only. Backfills 'Price AUD' / 'AUD Delta' on all SOL and ETH rows
+# and creates/updates the combined 'AUD' total tiles for every historical
+# date, using bulk historical prices. Safe to re-run (overwrites the AUD
+# columns so the delta chain stays consistent; AUD rows are updated in
+# place, not duplicated).
 on:
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Overwrite rows that already have an AUD Delta"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
 
 jobs:
   backfill:
@@ -32,7 +25,6 @@ jobs:
           NOTION_TOKEN:          ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_PERWALLET:   ${{ secrets.NOTION_DB_PERWALLET }}
           NOTION_DB_DAILYTOTAL:  ${{ secrets.NOTION_DB_DAILYTOTAL }}
-          PRICE_COIN_ID:         "solana"
+          TITLE_PROP_PERWALLET:  ${{ secrets.TITLE_PROP_PERWALLET }}
           COINGECKO_API_KEY:     ${{ secrets.COINGECKO_API_KEY }}
-          FORCE:                 ${{ inputs.force }}
-        run: python backfill_sol_aud.py
+        run: python backfill_aud.py
