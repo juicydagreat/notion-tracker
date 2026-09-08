@@ -161,15 +161,28 @@ def main():
     delta = r2(total_aud - num(prev_aud, AUD_VALUE_PROP)) if prev_aud else None
     log(f"  Previous AUD total: {num(prev_aud, AUD_VALUE_PROP) if prev_aud else None}  ->  Delta: {delta}")
 
-    notion_req(
-        "https://api.notion.com/v1/pages",
-        {"parent": {"database_id": NOTION_DB_DAILYTOTAL}, "properties": {
-            DAILYTOTAL_TITLE: {"title": [{"text": {"content": f"{total_aud:,.2f} {AUD_LABEL}"}}]},
-            "Date":           {"date": {"start": today}},
-            AUD_VALUE_PROP:   {"number": total_aud},
-            AUD_DELTA_PROP:   {"number": delta},
-        }},
+    props = {
+        DAILYTOTAL_TITLE: {"title": [{"text": {"content": f"{total_aud:,.2f} {AUD_LABEL}"}}]},
+        "Date":           {"date": {"start": today}},
+        AUD_VALUE_PROP:   {"number": total_aud},
+        AUD_DELTA_PROP:   {"number": delta},
+    }
+    # One AUD tile per day: update today's if present, else create; archive dups.
+    res = notion_req(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_DAILYTOTAL}/query",
+        {"filter": {"and": [
+            {"property": "Date", "date": {"equals": today}},
+            {"property": DAILYTOTAL_TITLE, "title": {"contains": AUD_LABEL}},
+        ]}, "page_size": 25},
     )
+    rows = res.get("results", [])
+    if not rows:
+        notion_req("https://api.notion.com/v1/pages",
+                   {"parent": {"database_id": NOTION_DB_DAILYTOTAL}, "properties": props})
+    else:
+        notion_req(f"https://api.notion.com/v1/pages/{rows[0]['id']}", {"properties": props}, method="PATCH")
+        for extra in rows[1:]:
+            notion_req(f"https://api.notion.com/v1/pages/{extra['id']}", {"archived": True}, method="PATCH")
     log(f"\nWrote combined row: {total_aud:,.2f} {AUD_LABEL}  (Δ {delta})")
 
 

@@ -380,6 +380,29 @@ def create_page(db_id, props):
     )
 
 
+def upsert_daily_total(today, props):
+    """One tile per day per asset: update today's existing row if present,
+    otherwise create it. Duplicate today-rows for this asset are archived."""
+    res = notion_req(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_DAILYTOTAL}/query",
+        {
+            "filter": {"and": [
+                {"property": "Date", "date": {"equals": today}},
+                {"property": DAILYTOTAL_TITLE, "title": {"contains": ASSET_LABEL}},
+            ]},
+            "page_size": 25,
+        },
+    )
+    rows = res.get("results", [])
+    if not rows:
+        create_page(NOTION_DB_DAILYTOTAL, props)
+        return
+    notion_req(f"https://api.notion.com/v1/pages/{rows[0]['id']}", {"properties": props}, method="PATCH")
+    for extra in rows[1:]:
+        notion_req(f"https://api.notion.com/v1/pages/{extra['id']}", {"archived": True}, method="PATCH")
+        log("  archived a duplicate daily-total row for today")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────────────
 def main():
     log("=" * 60)
@@ -452,7 +475,7 @@ def main():
     d_stable_t = r2(total_stable - p_stable_t) if prev_total else None
     d_aud_t    = aud_delta(d_eth_t)
     log(f"  ETH={total_eth} Δ{d_eth_t}  {STABLE_SYMBOL}={total_stable} Δ{d_stable_t}  AUDΔ{d_aud_t}")
-    create_page(NOTION_DB_DAILYTOTAL, {
+    upsert_daily_total(today, {
         DAILYTOTAL_TITLE:   {"title": [{"text": {"content": f"{total_eth:.4f} {ASSET_LABEL}"}}]},
         "Date":             {"date":  {"start": today}},
         "End Balance":      {"number": total_eth},
