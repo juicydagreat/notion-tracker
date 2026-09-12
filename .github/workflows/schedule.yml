@@ -14,6 +14,12 @@ on:
           - production
           - diagnostic
           - activity
+          - trace
+      target_sol:
+        description: "trace mode: SOL amount to search for"
+        required: false
+        default: "5"
+        type: string
 
 jobs:
   run-tracker:
@@ -35,6 +41,8 @@ jobs:
             echo "script=sol_multi_to_notion.py" >> $GITHUB_OUTPUT
           elif [ "${{ inputs.mode }}" = "activity" ]; then
             echo "script=sol_activity.py" >> $GITHUB_OUTPUT
+          elif [ "${{ inputs.mode }}" = "trace" ]; then
+            echo "script=sol_trace.py" >> $GITHUB_OUTPUT
           else
             echo "script=sol_diagnostic.py" >> $GITHUB_OUTPUT
           fi
@@ -54,6 +62,8 @@ jobs:
           # Isolates this tracker's rows in the shared daily-total DB so deltas
           # compare SOL-to-SOL only (not ETH rows or manual notes).
           ASSET_LABEL:           "SOL"
+          # trace mode: amount to search for (from the Run-workflow input)
+          TARGET_SOL:            ${{ inputs.target_sol }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
