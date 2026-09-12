@@ -25,6 +25,19 @@ on:
         required: false
         default: ""
         type: string
+      after_aest:
+        description: "trace mode: ignore txns before this AEST time (window start)"
+        required: false
+        default: ""
+        type: string
+      list_all:
+        description: "trace mode: list EVERY txn in the window (any amount, in or out)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
       min_sol:
         description: "trace mode: range search — min SOL (overrides target_sol)"
         required: false
@@ -88,6 +101,8 @@ jobs:
           MIN_SOL:               ${{ inputs.min_sol }}
           MAX_SOL:               ${{ inputs.max_sol }}
           SCAN_DEPTH:            ${{ inputs.scan_depth }}
+          AFTER_AEST:            ${{ inputs.after_aest }}
+          LIST_ALL:              ${{ inputs.list_all }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"

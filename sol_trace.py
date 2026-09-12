@@ -30,6 +30,8 @@ MIN_SOL    = os.environ.get("MIN_SOL", "").strip()        # range mode: lower bo
 MAX_SOL    = os.environ.get("MAX_SOL", "").strip()        # range mode: upper bound
 SCAN_DEPTH = int(os.environ.get("SCAN_DEPTH",   "8"))     # txns per wallet to inspect
 BEFORE_AEST = os.environ.get("BEFORE_AEST", "").strip()   # e.g. "2026-09-12 10:00" — ignore txns at/after
+AFTER_AEST  = os.environ.get("AFTER_AEST", "").strip()    # e.g. "2026-09-12 00:00" — ignore txns before
+LIST_ALL    = os.environ.get("LIST_ALL", "").strip().lower() in ("1", "true", "yes")  # list every tx in window
 
 
 def parse_before_cutoff(s):
@@ -102,25 +104,32 @@ def main():
         fail("No valid Solana pubkeys found in WALLETS_CSV")
     wallet_set = set(wallets)
 
-    cutoff = parse_before_cutoff(BEFORE_AEST)
+    before_cut = parse_before_cutoff(BEFORE_AEST)
+    after_cut  = parse_before_cutoff(AFTER_AEST)
 
     # Range mode (MIN_SOL/MAX_SOL set) beats target±tolerance.
     if MIN_SOL or MAX_SOL:
         lo = float(MIN_SOL) if MIN_SOL else 0.0
         hi = float(MAX_SOL) if MAX_SOL else float("inf")
-        window = f"between {lo:.2f} and {'∞' if hi == float('inf') else f'{hi:.2f}'} SOL"
+        amt_desc = f"between {lo:.2f} and {'∞' if hi == float('inf') else f'{hi:.2f}'} SOL"
     else:
         lo, hi = TARGET_SOL - TOLERANCE, TARGET_SOL + TOLERANCE
-        window = f"~{TARGET_SOL} SOL  (window {lo:.2f}–{hi:.2f})"
+        amt_desc = f"~{TARGET_SOL} SOL  (window {lo:.2f}–{hi:.2f})"
+
+    def fmt(ts, tz):
+        return datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M")
 
     print("=" * 78)
     print(f"RPC:      {SOLANA_RPC_URL}")
     print(f"Wallets:  {len(wallets)}   |   scanning last {SCAN_DEPTH} txns each")
-    print(f"Looking for OUTFLOWS {window}")
-    if cutoff:
-        c_aest = datetime.fromtimestamp(cutoff, tz=AEST).strftime("%Y-%m-%d %H:%M AEST")
-        c_utc  = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        print(f"Cutoff:   ignoring transactions at/after {c_aest}  ({c_utc})")
+    if LIST_ALL:
+        print("Mode:     LIST ALL transactions in the time window (any amount, in or out)")
+    else:
+        print(f"Mode:     OUTFLOWS {amt_desc}")
+    if after_cut:
+        print(f"From:     {fmt(after_cut, AEST)} AEST  ({fmt(after_cut, timezone.utc)} UTC)")
+    if before_cut:
+        print(f"To:       {fmt(before_cut, AEST)} AEST  ({fmt(before_cut, timezone.utc)} UTC)  (exclusive)")
     print("=" * 78)
 
     hits = []
@@ -136,8 +145,13 @@ def main():
             if not sig:
                 continue
             bt = s.get("blockTime")
-            if cutoff and (bt is None or bt >= cutoff):
-                continue   # ignore transactions at/after the cutoff
+            # keep only transactions inside [after_cut, before_cut)
+            if (after_cut or before_cut) and bt is None:
+                continue
+            if before_cut and bt >= before_cut:
+                continue
+            if after_cut and bt < after_cut:
+                continue
             time.sleep(INDIVIDUAL_DELAY)
             try:
                 tx = rpc({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
@@ -153,29 +167,42 @@ def main():
             if wi >= len(pre) or wi >= len(post):
                 continue
             delta = (post[wi] - pre[wi]) / 1e9          # negative = SOL left this wallet
-            out = -delta                                 # positive = SOL left this wallet
-            if out > 0 and lo <= out <= hi:
-                # destination = account that gained the most SOL in this tx
-                gains = [((post[j] - pre[j]) / 1e9, keys[j]) for j in range(min(len(pre), len(post), len(keys)))]
-                gains = [(g, k) for g, k in gains if k != w]
-                dest_amt, dest = max(gains, default=(0.0, None))
-                where = "?" if dest is None else ("INTERNAL (your wallet)" if dest in wallet_set else "EXTERNAL")
-                hits.append((s.get("blockTime"), w, out, dest, where, sig))
-                log(f"  [{i:3d}/{len(wallets)}] {mask(w)}  MATCH  -{out:.4f} SOL  -> {mask(dest) if dest else '?'}  [{where}]")
+            others = [((post[j] - pre[j]) / 1e9, keys[j])
+                      for j in range(min(len(pre), len(post), len(keys))) if keys[j] != w]
+            if delta < 0:
+                cp_amt, cp = max(others, default=(0.0, None))   # who received
+            else:
+                cp_amt, cp = min(others, default=(0.0, None))   # who sent
+            where = "?" if cp is None else ("INTERNAL (your wallet)" if cp in wallet_set else "EXTERNAL")
+
+            if LIST_ALL:
+                hits.append((bt, w, delta, cp, where, sig))
+                arrow = "->" if delta < 0 else "<-"
+                log(f"  [{i:3d}/{len(wallets)}] {mask(w)}  {delta:+.4f} SOL  {arrow} {mask(cp) if cp else '?'}  [{where}]")
+            else:
+                out = -delta
+                if out > 0 and lo <= out <= hi:
+                    hits.append((bt, w, delta, cp, where, sig))
+                    log(f"  [{i:3d}/{len(wallets)}] {mask(w)}  MATCH  {delta:+.4f} SOL  -> {mask(cp) if cp else '?'}  [{where}]")
         if i % 25 == 0:
             log(f"  ...scanned {i}/{len(wallets)}")
 
     print()
     print("=" * 78)
-    print(f"MATCHING OUTFLOWS {window}  ({len(hits)} found)")
+    title = "ALL ACTIVITY in window" if LIST_ALL else f"MATCHING OUTFLOWS {amt_desc}"
+    print(f"{title}  ({len(hits)} found)")
     print("=" * 78)
-    for bt, w, out, dest, where, sig in sorted(hits, key=lambda x: (x[0] or 0), reverse=True):
-        ts = datetime.fromtimestamp(bt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if bt else "time?"
-        print(f"  {ts}   {mask(w)}  sent -{out:.4f} SOL  ->  {mask(dest) if dest else '?'}  [{where}]")
+    for bt, w, delta, cp, where, sig in sorted(hits, key=lambda x: (x[0] or 0), reverse=True):
+        ts = fmt(bt, timezone.utc) + " UTC" if bt else "time?"
+        verb, arrow = ("sent", "->") if delta < 0 else ("recv", "<-")
+        print(f"  {ts}   {mask(w)}  {verb} {abs(delta):.4f} SOL  {arrow}  {mask(cp) if cp else '?'}  [{where}]")
         print(f"      tx: {sig}")
     if not hits:
-        print("  No outflow near that amount in the scanned window.")
-        print(f"  Try a wider TOLERANCE or larger SCAN_DEPTH.")
+        if LIST_ALL:
+            print("  No transactions in that time window — no activity.")
+        else:
+            print("  No outflow near that amount in the scanned window.")
+            print("  Try a wider range, a larger scan_depth, or LIST_ALL to see everything.")
     print("=" * 78)
 
 
