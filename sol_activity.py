@@ -16,6 +16,7 @@ RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",      "30"))
 RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",      "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP", "30"))
 INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
+AMOUNTS_TOP_N    = int(os.environ.get("AMOUNTS_TOP_N", "20"))
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -88,6 +89,23 @@ def ago(bt, now):
     return f"{m}m ago"
 
 
+def last_tx_amount(wallet, sig):
+    """Net SOL change for `wallet` in transaction `sig`
+    (positive = received, negative = sent/fees). None if unavailable."""
+    tx = rpc({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+              "params": [sig, {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}]})
+    if not tx:
+        return None
+    meta = tx.get("meta") or {}
+    pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
+    keys = (tx.get("transaction") or {}).get("message", {}).get("accountKeys", [])
+    for i, k in enumerate(keys):
+        pk = k.get("pubkey") if isinstance(k, dict) else k
+        if pk == wallet and i < len(pre) and i < len(post):
+            return (post[i] - pre[i]) / 1e9
+    return None
+
+
 def main():
     wallets = parse_wallets(WALLETS_CSV)
     if not wallets:
@@ -96,6 +114,7 @@ def main():
     print("=" * 72)
     print(f"RPC:      {SOLANA_RPC_URL}")
     print(f"Wallets:  {len(wallets)}   (checking most recent transaction each)")
+    print(f"Amounts:  fetching for the {AMOUNTS_TOP_N} most recent")
     print("=" * 72)
 
     now = datetime.now(timezone.utc).timestamp()
@@ -113,13 +132,25 @@ def main():
     no_time = [r for r in rows if r[1] is None and r[2] is not None]   # tx exists, no blockTime
     never   = [r for r in rows if r[2] is None]
 
+    # Fetch the SOL amount moved for the N most recent wallets only.
+    amounts = {}
+    if active:
+        print(f"\n--- Fetching amounts for the {min(AMOUNTS_TOP_N, len(active))} most recent ---")
+        for w, bt, sig in active[:AMOUNTS_TOP_N]:
+            amounts[sig] = last_tx_amount(w, sig)
+            time.sleep(INDIVIDUAL_DELAY)
+
+    def amt_str(sig):
+        a = amounts.get(sig)
+        return f"{a:+.4f} SOL" if a is not None else ""
+
     print()
     print("=" * 72)
     print("MOST RECENTLY ACTIVE (newest first)")
     print("=" * 72)
     for i, (w, bt, sig) in enumerate(active, 1):
         ts = datetime.fromtimestamp(bt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        print(f"  {i:3d}. {mask(w)}  {ago(bt, now):>12}   {ts}   {sig[:16]}...")
+        print(f"  {i:3d}. {mask(w)}  {ago(bt, now):>12}   {ts}   {amt_str(sig):>16}   {sig[:16]}...")
     for w, bt, sig in no_time:
         print(f"     - {mask(w)}  recent tx (time unavailable)   {sig[:16]}...")
 
@@ -127,7 +158,7 @@ def main():
     if active:
         w, bt, sig = active[0]
         ts = datetime.fromtimestamp(bt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        print(f"Most recent activity: {mask(w)}  ({ago(bt, now)}, {ts})")
+        print(f"Most recent activity: {mask(w)}  ({ago(bt, now)}, {ts})  {amt_str(sig)}")
     print(f"Wallets with no transactions: {len(never)}")
     print("=" * 72)
 
