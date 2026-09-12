@@ -25,6 +25,16 @@ on:
         required: false
         default: ""
         type: string
+      min_sol:
+        description: "trace mode: range search — min SOL (overrides target_sol)"
+        required: false
+        default: ""
+        type: string
+      max_sol:
+        description: "trace mode: range search — max SOL"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   run-tracker:
@@ -67,9 +77,11 @@ jobs:
           # Isolates this tracker's rows in the shared daily-total DB so deltas
           # compare SOL-to-SOL only (not ETH rows or manual notes).
           ASSET_LABEL:           "SOL"
-          # trace mode: amount to search for + optional AEST cutoff
+          # trace mode: amount to search for + optional AEST cutoff + range
           TARGET_SOL:            ${{ inputs.target_sol }}
           BEFORE_AEST:           ${{ inputs.before_aest }}
+          MIN_SOL:               ${{ inputs.min_sol }}
+          MAX_SOL:               ${{ inputs.max_sol }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
