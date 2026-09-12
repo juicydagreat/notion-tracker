@@ -35,6 +35,11 @@ on:
         required: false
         default: ""
         type: string
+      scan_depth:
+        description: "trace mode: transactions to scan per wallet (default 8)"
+        required: false
+        default: "8"
+        type: string
 
 jobs:
   run-tracker:
@@ -82,6 +87,7 @@ jobs:
           BEFORE_AEST:           ${{ inputs.before_aest }}
           MIN_SOL:               ${{ inputs.min_sol }}
           MAX_SOL:               ${{ inputs.max_sol }}
+          SCAN_DEPTH:            ${{ inputs.scan_depth }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"
