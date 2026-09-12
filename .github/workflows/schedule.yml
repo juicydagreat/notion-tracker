@@ -20,6 +20,11 @@ on:
         required: false
         default: "5"
         type: string
+      before_aest:
+        description: "trace mode: ignore txns at/after this AEST time (YYYY-MM-DD HH:MM)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   run-tracker:
@@ -62,8 +67,9 @@ jobs:
           # Isolates this tracker's rows in the shared daily-total DB so deltas
           # compare SOL-to-SOL only (not ETH rows or manual notes).
           ASSET_LABEL:           "SOL"
-          # trace mode: amount to search for (from the Run-workflow input)
+          # trace mode: amount to search for + optional AEST cutoff
           TARGET_SOL:            ${{ inputs.target_sol }}
+          BEFORE_AEST:           ${{ inputs.before_aest }}
           # Batch RPC endpoints (optional — if blocked, script auto-falls back to individual calls)
           SOLANA_PRIMARY_RPC:    "https://solana-rpc.publicnode.com"
           SOLANA_FALLBACK_RPC:   "https://rpc.ankr.com/solana"

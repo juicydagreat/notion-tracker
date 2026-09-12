@@ -13,7 +13,9 @@ Run workflow → mode=trace (set target_sol).
 """
 import os, sys, json, time, random, re
 import urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+AEST = timezone(timedelta(hours=10))   # Sept is AEST (UTC+10), pre-daylight-saving
 
 SOLANA_RPC_URL   = os.environ.get("INDIVIDUAL_RPC", "https://api.mainnet-beta.solana.com").strip()
 WALLETS_CSV      = os.environ.get("WALLETS_CSV", "")
@@ -25,6 +27,19 @@ INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "0.4"))
 TARGET_SOL = float(os.environ.get("TARGET_SOL", "5"))
 TOLERANCE  = float(os.environ.get("TOLERANCE",  "1.0"))   # match window: TARGET ± this
 SCAN_DEPTH = int(os.environ.get("SCAN_DEPTH",   "8"))     # txns per wallet to inspect
+BEFORE_AEST = os.environ.get("BEFORE_AEST", "").strip()   # e.g. "2026-09-12 10:00" — ignore txns at/after
+
+
+def parse_before_cutoff(s):
+    """Parse an AEST 'YYYY-MM-DD HH:MM' (or with 'T') into a UTC epoch, or None."""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=AEST).timestamp()
+        except ValueError:
+            continue
+    fail(f"Could not parse BEFORE_AEST={s!r}; use 'YYYY-MM-DD HH:MM' (AEST)")
 
 PUBKEY_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
@@ -85,11 +100,17 @@ def main():
         fail("No valid Solana pubkeys found in WALLETS_CSV")
     wallet_set = set(wallets)
 
+    cutoff = parse_before_cutoff(BEFORE_AEST)
+
     lo, hi = TARGET_SOL - TOLERANCE, TARGET_SOL + TOLERANCE
     print("=" * 78)
     print(f"RPC:      {SOLANA_RPC_URL}")
     print(f"Wallets:  {len(wallets)}   |   scanning last {SCAN_DEPTH} txns each")
     print(f"Looking for OUTFLOWS of {TARGET_SOL} SOL  (match window {lo:.2f}–{hi:.2f} SOL)")
+    if cutoff:
+        c_aest = datetime.fromtimestamp(cutoff, tz=AEST).strftime("%Y-%m-%d %H:%M AEST")
+        c_utc  = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        print(f"Cutoff:   ignoring transactions at/after {c_aest}  ({c_utc})")
     print("=" * 78)
 
     hits = []
@@ -104,6 +125,9 @@ def main():
             sig = s.get("signature")
             if not sig:
                 continue
+            bt = s.get("blockTime")
+            if cutoff and (bt is None or bt >= cutoff):
+                continue   # ignore transactions at/after the cutoff
             time.sleep(INDIVIDUAL_DELAY)
             try:
                 tx = rpc({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
