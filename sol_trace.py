@@ -26,6 +26,8 @@ INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "0.4"))
 
 TARGET_SOL = float(os.environ.get("TARGET_SOL", "5"))
 TOLERANCE  = float(os.environ.get("TOLERANCE",  "1.0"))   # match window: TARGET ± this
+MIN_SOL    = os.environ.get("MIN_SOL", "").strip()        # range mode: lower bound
+MAX_SOL    = os.environ.get("MAX_SOL", "").strip()        # range mode: upper bound
 SCAN_DEPTH = int(os.environ.get("SCAN_DEPTH",   "8"))     # txns per wallet to inspect
 BEFORE_AEST = os.environ.get("BEFORE_AEST", "").strip()   # e.g. "2026-09-12 10:00" — ignore txns at/after
 
@@ -102,11 +104,19 @@ def main():
 
     cutoff = parse_before_cutoff(BEFORE_AEST)
 
-    lo, hi = TARGET_SOL - TOLERANCE, TARGET_SOL + TOLERANCE
+    # Range mode (MIN_SOL/MAX_SOL set) beats target±tolerance.
+    if MIN_SOL or MAX_SOL:
+        lo = float(MIN_SOL) if MIN_SOL else 0.0
+        hi = float(MAX_SOL) if MAX_SOL else float("inf")
+        window = f"between {lo:.2f} and {'∞' if hi == float('inf') else f'{hi:.2f}'} SOL"
+    else:
+        lo, hi = TARGET_SOL - TOLERANCE, TARGET_SOL + TOLERANCE
+        window = f"~{TARGET_SOL} SOL  (window {lo:.2f}–{hi:.2f})"
+
     print("=" * 78)
     print(f"RPC:      {SOLANA_RPC_URL}")
     print(f"Wallets:  {len(wallets)}   |   scanning last {SCAN_DEPTH} txns each")
-    print(f"Looking for OUTFLOWS of {TARGET_SOL} SOL  (match window {lo:.2f}–{hi:.2f} SOL)")
+    print(f"Looking for OUTFLOWS {window}")
     if cutoff:
         c_aest = datetime.fromtimestamp(cutoff, tz=AEST).strftime("%Y-%m-%d %H:%M AEST")
         c_utc  = datetime.fromtimestamp(cutoff, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -157,7 +167,7 @@ def main():
 
     print()
     print("=" * 78)
-    print(f"MATCHES for ~{TARGET_SOL} SOL outflow ({len(hits)} found)")
+    print(f"MATCHING OUTFLOWS {window}  ({len(hits)} found)")
     print("=" * 78)
     for bt, w, out, dest, where, sig in sorted(hits, key=lambda x: (x[0] or 0), reverse=True):
         ts = datetime.fromtimestamp(bt, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if bt else "time?"
