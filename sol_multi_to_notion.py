@@ -75,6 +75,22 @@ def parse_wallets(raw):
     return out
 
 
+def report_wallet_parse(raw, accepted):
+    """Surface silently-dropped wallets — a common cause of a total being short
+    after the wallet list is edited (a typo'd address isn't counted)."""
+    chunks = [c for c in re.split(r"[\s,;]+", (raw or "").strip()) if c]
+    accepted_set = set(accepted)
+    suspicious = [c for c in chunks if c not in accepted_set and len(c) >= 30]
+    dupes = len(PUBKEY_RE.findall(raw or "")) - len(accepted)
+    log(f"  Wallet parse: {len(chunks)} entries in secret -> {len(accepted)} valid addresses accepted")
+    if dupes > 0:
+        log(f"  note: {dupes} duplicate address(es) collapsed")
+    if suspicious:
+        log(f"  WARNING: {len(suspicious)} entr(y/ies) look like an address but were REJECTED (SOL NOT counted):")
+        for c in suspicious[:20]:
+            log(f"    rejected: {mask(c)}  (length {len(c)}; a valid Solana address is 32-44 base58 chars)")
+
+
 def backoff(attempt):
     d = min(2 ** attempt + random.uniform(0, 0.8), RPC_BACKOFF_CAP)
     log(f"  [backoff] {d:.1f}s")
@@ -392,6 +408,7 @@ def main():
     log(f"Fallback RPC: {INDIVIDUAL_RPC}")
 
     wallets = parse_wallets(WALLETS_CSV)
+    report_wallet_parse(WALLETS_CSV, wallets)
     if not wallets:
         fail("No valid Solana pubkeys found in WALLETS_CSV")
 

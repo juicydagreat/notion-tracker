@@ -32,6 +32,19 @@ def parse_wallets(raw):
     return out
 
 
+def report_wallet_parse(raw, accepted):
+    chunks = [c for c in re.split(r"[\s,;]+", (raw or "").strip()) if c]
+    accepted_set = set(accepted)
+    suspicious = [c for c in chunks if c not in accepted_set and len(c) >= 30]
+    dupes = len(PUBKEY_RE.findall(raw or "")) - len(accepted)
+    log(f"Entries in secret: {len(chunks)}  ->  accepted: {len(accepted)}"
+        + (f"  (dupes collapsed: {dupes})" if dupes > 0 else ""))
+    if suspicious:
+        log(f"WARNING: {len(suspicious)} malformed address(es) REJECTED (SOL not counted):")
+        for c in suspicious[:20]:
+            log(f"  rejected: {mask(c)}  (length {len(c)}; valid = 32-44 base58 chars)")
+
+
 def backoff(attempt):
     d = min(2 ** attempt + random.uniform(0, 0.8), RPC_BACKOFF_CAP)
     log(f"  Retrying in {d:.1f}s...")
@@ -70,6 +83,7 @@ def get_sol_balance(wallet):
 
 def main():
     wallets = parse_wallets(WALLETS_CSV)
+    report_wallet_parse(WALLETS_CSV, wallets)
     if not wallets:
         fail("No valid Solana pubkeys found in WALLETS_CSV")
 
