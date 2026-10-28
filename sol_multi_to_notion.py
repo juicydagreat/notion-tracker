@@ -47,8 +47,9 @@ RPC_TIMEOUT      = int(os.environ.get("RPC_TIMEOUT",       "30"))
 RPC_RETRIES      = int(os.environ.get("RPC_RETRIES",       "5"))
 RPC_BACKOFF_CAP  = float(os.environ.get("RPC_BACKOFF_CAP",  "30.0"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "10"))
-BATCH_PAUSE      = float(os.environ.get("BATCH_PAUSE",      "2.0"))
-INDIVIDUAL_DELAY = float(os.environ.get("INDIVIDUAL_DELAY", "2.0"))
+BATCH_PAUSE        = float(os.environ.get("BATCH_PAUSE",        "2.0"))
+INDIVIDUAL_DELAY   = float(os.environ.get("INDIVIDUAL_DELAY",   "2.0"))
+NOTION_WRITE_DELAY = float(os.environ.get("NOTION_WRITE_DELAY", "0.35"))
 
 _rpc_primary  = os.environ.get("SOLANA_PRIMARY_RPC",  "https://solana-rpc.publicnode.com").strip()
 _rpc_fallback = os.environ.get("SOLANA_FALLBACK_RPC", "https://rpc.ankr.com/solana").strip()
@@ -377,6 +378,26 @@ def create_page(db_id, props):
     )
 
 
+def update_page(page_id, props):
+    notion_req(f"https://api.notion.com/v1/pages/{page_id}", {"properties": props}, method="PATCH")
+
+
+def get_today_perwallet_ids(today):
+    """Return {wallet: page_id} for per-wallet rows already written today."""
+    rows = notion_query_paginated(NOTION_DB_PERWALLET, {
+        "filter": {"property": "Date", "date": {"equals": today}},
+        "page_size": 100,
+    })
+    lookup = {}
+    for page in rows:
+        try:
+            w = page["properties"][TITLE_PROP]["title"][0]["plain_text"]
+            lookup[w] = page["id"]
+        except (KeyError, IndexError):
+            continue
+    return lookup
+
+
 def upsert_daily_total(today, props):
     """One tile per day per asset: update today's existing row if present,
     otherwise create it. Any duplicate today-rows for this asset (from earlier
@@ -438,14 +459,16 @@ def main():
     ensure_number_props(NOTION_DB_DAILYTOTAL, [PRICE_PROP, AUD_DELTA_PROP])
 
     log(f"\n--- Fetching previous Notion rows ---")
-    prev_lookup = get_prev_perwallet_rows(today, wallets)
-    prev_total  = get_prev_total_row(today)
-    log(f"  {len(prev_lookup)} previous per-wallet rows found")
+    prev_lookup   = get_prev_perwallet_rows(today, wallets)
+    prev_total    = get_prev_total_row(today)
+    today_pw_ids  = get_today_perwallet_ids(today)
+    log(f"  {len(prev_lookup)} previous per-wallet rows  |  {len(today_pw_ids)} already written today")
 
     def aud_delta(delta):
         return r2(delta * sol_price) if (delta is not None and sol_price is not None) else None
 
     log(f"\n--- Writing {len(wallets)} per-wallet rows to Notion ---")
+    write_errors = 0
     for i, (w, sol, usdc) in enumerate(zip(wallets, sol_list, usdc_list), 1):
         sol  = r2(sol)
         usdc = r2(usdc)
@@ -453,8 +476,9 @@ def main():
         d_sol  = r2(sol  - get_num(prev, "End Balance"))      if prev else None
         d_usdc = r2(usdc - get_num(prev, "USDC End Balance")) if prev else None
         d_aud  = aud_delta(d_sol)
-        log(f"  [{i:02d}/{len(wallets)}] {mask(w)}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}  AUD\u0394{d_aud}")
-        create_page(NOTION_DB_PERWALLET, {
+        action = "upd" if w in today_pw_ids else "new"
+        log(f"  [{i:02d}/{len(wallets)}] [{action}] {mask(w)}  SOL={sol} \u0394{d_sol}  USDC={usdc} \u0394{d_usdc}  AUD\u0394{d_aud}")
+        props = {
             TITLE_PROP:         {"title": [{"text": {"content": w}}]},
             "Date":             {"date":  {"start": today}},
             "End Balance":      {"number": sol},
@@ -463,7 +487,18 @@ def main():
             "USDC Delta":       {"number": d_usdc},
             PRICE_PROP:         {"number": sol_price},
             AUD_DELTA_PROP:     {"number": d_aud},
-        })
+        }
+        try:
+            if w in today_pw_ids:
+                update_page(today_pw_ids[w], props)
+            else:
+                create_page(NOTION_DB_PERWALLET, props)
+        except Exception as e:
+            log(f"  WARNING: failed to write {mask(w)}: {e}")
+            write_errors += 1
+        time.sleep(NOTION_WRITE_DELAY)
+    if write_errors:
+        log(f"  {write_errors} per-wallet write(s) failed \u2014 daily total will still be written")
 
     log(f"\n--- Writing daily total row ---")
     p_sol_t  = get_num(prev_total, "End Balance")
